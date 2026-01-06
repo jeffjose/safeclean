@@ -60,6 +60,10 @@ struct Cli {
     /// Skip confirmation prompt
     #[arg(short = 'y', long)]
     yes: bool,
+
+    /// Demo mode - show UI with simulated data (nothing is deleted)
+    #[arg(long)]
+    demo: bool,
 }
 
 fn format_size(bytes: u64) -> String {
@@ -114,6 +118,81 @@ fn get_enabled_types(cli: &Cli) -> HashSet<ProjectType> {
     types
 }
 
+fn generate_demo_data() -> Vec<FoundDir> {
+    vec![
+        // Rust projects
+        FoundDir {
+            path: "/home/user/projects/api-server/target".into(),
+            project_type: ProjectType::Rust,
+            size_bytes: 1_892_000_000, // 1.9 GB
+        },
+        FoundDir {
+            path: "/home/user/projects/cli-tool/target".into(),
+            project_type: ProjectType::Rust,
+            size_bytes: 456_000_000, // 456 MB
+        },
+        FoundDir {
+            path: "/home/user/projects/utils/target".into(),
+            project_type: ProjectType::Rust,
+            size_bytes: 234_000_000, // 234 MB
+        },
+        // Node.js projects
+        FoundDir {
+            path: "/home/user/projects/webapp/node_modules".into(),
+            project_type: ProjectType::Node,
+            size_bytes: 892_000_000, // 892 MB
+        },
+        FoundDir {
+            path: "/home/user/projects/dashboard/node_modules".into(),
+            project_type: ProjectType::Node,
+            size_bytes: 654_000_000, // 654 MB
+        },
+        FoundDir {
+            path: "/home/user/projects/blog/node_modules".into(),
+            project_type: ProjectType::Node,
+            size_bytes: 423_000_000, // 423 MB
+        },
+        FoundDir {
+            path: "/home/user/projects/portfolio/node_modules".into(),
+            project_type: ProjectType::Node,
+            size_bytes: 312_000_000, // 312 MB
+        },
+        // Python projects
+        FoundDir {
+            path: "/home/user/projects/ml-pipeline/.venv".into(),
+            project_type: ProjectType::Python,
+            size_bytes: 1_234_000_000, // 1.2 GB
+        },
+        FoundDir {
+            path: "/home/user/projects/data-analysis/.venv".into(),
+            project_type: ProjectType::Python,
+            size_bytes: 567_000_000, // 567 MB
+        },
+        FoundDir {
+            path: "/home/user/projects/scripts/__pycache__".into(),
+            project_type: ProjectType::Python,
+            size_bytes: 12_000_000, // 12 MB
+        },
+        // Next.js
+        FoundDir {
+            path: "/home/user/projects/webapp/.next".into(),
+            project_type: ProjectType::NextJs,
+            size_bytes: 345_000_000, // 345 MB
+        },
+        // Gradle
+        FoundDir {
+            path: "/home/user/projects/android-app/build".into(),
+            project_type: ProjectType::Gradle,
+            size_bytes: 789_000_000, // 789 MB
+        },
+        FoundDir {
+            path: "/home/user/projects/android-app/.gradle".into(),
+            project_type: ProjectType::Gradle,
+            size_bytes: 234_000_000, // 234 MB
+        },
+    ]
+}
+
 fn group_by_type(dirs: &[FoundDir]) -> Vec<(ProjectType, Vec<&FoundDir>)> {
     let mut grouped: std::collections::HashMap<ProjectType, Vec<&FoundDir>> =
         std::collections::HashMap::new();
@@ -137,25 +216,35 @@ fn group_by_type(dirs: &[FoundDir]) -> Vec<(ProjectType, Vec<&FoundDir>)> {
 fn main() {
     let cli = Cli::parse();
 
-    let path = cli.path.canonicalize().unwrap_or_else(|_| {
-        eprintln!("{} Invalid path: {}", "error:".red().bold(), cli.path.display());
-        std::process::exit(1);
-    });
+    let found = if cli.demo {
+        println!(
+            "{} {}\n",
+            "Demo mode".yellow().bold(),
+            "(simulated data - nothing will be deleted)".dimmed()
+        );
+        generate_demo_data()
+    } else {
+        let path = cli.path.canonicalize().unwrap_or_else(|_| {
+            eprintln!("{} Invalid path: {}", "error:".red().bold(), cli.path.display());
+            std::process::exit(1);
+        });
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-    );
-    spinner.set_message(format!("Searching for build artifacts in {}", path.display()));
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        );
+        spinner.set_message(format!("Searching for build artifacts in {}", path.display()));
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    let enabled_types = get_enabled_types(&cli);
-    let found = scanner::scan(&path, &enabled_types);
+        let enabled_types = get_enabled_types(&cli);
+        let result = scanner::scan(&path, &enabled_types);
 
-    spinner.finish_and_clear();
+        spinner.finish_and_clear();
+        result
+    };
 
     if found.is_empty() {
         println!("{}", "No cleanable directories found.".yellow());
@@ -213,6 +302,36 @@ fn main() {
 
     if to_delete.is_empty() {
         println!("{}", "Nothing selected.".yellow());
+        return;
+    }
+
+    if cli.demo {
+        // Demo mode - just show what would be deleted
+        let total: u64 = to_delete.iter().map(|d| d.size_bytes).sum();
+        println!(
+            "\n{} Would delete {} directories ({}):",
+            "Demo:".yellow().bold(),
+            to_delete.len().to_string().green(),
+            format_size(total).green().bold()
+        );
+        let grouped = group_by_type(&to_delete);
+        for (project_type, dirs) in &grouped {
+            let group_size: u64 = dirs.iter().map(|d| d.size_bytes).sum();
+            println!(
+                "\n  {} ({} items, {})",
+                project_type.name().bold(),
+                dirs.len(),
+                format_size(group_size).green()
+            );
+            for dir in dirs {
+                println!("    {} {:>10}", dir.path.display(), dir.size_human());
+            }
+        }
+        println!(
+            "\n{} {}",
+            "Nothing was deleted - this is a demo.".yellow(),
+            "Run without --demo to actually clean.".dimmed()
+        );
         return;
     }
 
