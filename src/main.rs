@@ -1,12 +1,14 @@
 mod cleaner;
 mod projects;
 mod scanner;
+mod selector;
 
 use clap::Parser;
 use colored::Colorize;
-use dialoguer::MultiSelect;
+use indicatif::{ProgressBar, ProgressStyle};
 use projects::ProjectType;
 use scanner::FoundDir;
+use selector::GroupedSelector;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -112,17 +114,24 @@ fn get_enabled_types(cli: &Cli) -> HashSet<ProjectType> {
     types
 }
 
-fn build_display_item(dir: &FoundDir, max_path_len: usize) -> String {
-    let path_str = dir.path.display().to_string();
-    let size_str = dir.size_human();
-    let type_str = format!("[{}]", dir.project_type.name());
-    format!(
-        "{:<width$}  {:>10}  {}",
-        path_str,
-        size_str,
-        type_str,
-        width = max_path_len
-    )
+fn group_by_type(dirs: &[FoundDir]) -> Vec<(ProjectType, Vec<&FoundDir>)> {
+    let mut grouped: std::collections::HashMap<ProjectType, Vec<&FoundDir>> =
+        std::collections::HashMap::new();
+
+    for dir in dirs {
+        grouped.entry(dir.project_type).or_default().push(dir);
+    }
+
+    let type_order = ProjectType::all();
+    let mut result: Vec<(ProjectType, Vec<&FoundDir>)> = Vec::new();
+
+    for pt in type_order {
+        if let Some(dirs) = grouped.remove(&pt) {
+            result.push((pt, dirs));
+        }
+    }
+
+    result
 }
 
 fn main() {
@@ -133,14 +142,20 @@ fn main() {
         std::process::exit(1);
     });
 
-    println!(
-        "{} {}...\n",
-        "Scanning".cyan().bold(),
-        path.display()
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
     );
+    spinner.set_message(format!("Searching for build artifacts in {}", path.display()));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
     let enabled_types = get_enabled_types(&cli);
     let found = scanner::scan(&path, &enabled_types);
+
+    spinner.finish_and_clear();
 
     if found.is_empty() {
         println!("{}", "No cleanable directories found.".yellow());
@@ -156,62 +171,50 @@ fn main() {
 
     if cli.dry_run {
         println!("{}", "Dry run - nothing will be deleted:\n".yellow());
-        for dir in &found {
+        let grouped = group_by_type(&found);
+        for (project_type, dirs) in &grouped {
+            let group_size: u64 = dirs.iter().map(|d| d.size_bytes).sum();
             println!(
-                "  {}  {:>10}  {}",
-                dir.path.display(),
-                dir.size_human(),
-                format!("[{}]", dir.project_type.name()).dimmed()
+                "{} {} ({} items, {})",
+                "▼".dimmed(),
+                project_type.name().bold(),
+                dirs.len(),
+                format_size(group_size).green()
             );
+            for dir in dirs {
+                println!(
+                    "    {}  {:>10}",
+                    dir.path.display(),
+                    dir.size_human()
+                );
+            }
+            println!();
         }
         println!(
-            "\n{} {}",
+            "{} {}",
             "Total:".bold(),
             format_size(total_size).green().bold()
         );
         return;
     }
 
-    // Build items for multi-select
-    let max_path_len = found
-        .iter()
-        .map(|d| d.path.display().to_string().len())
-        .max()
-        .unwrap_or(50);
-
-    let items: Vec<String> = found.iter().map(|d| build_display_item(d, max_path_len)).collect();
-
-    // All selected by default
-    let defaults: Vec<bool> = vec![true; found.len()];
-
-    let selected_indices = if cli.yes {
-        // Skip confirmation, select all
-        (0..found.len()).collect()
+    let to_delete = if cli.yes {
+        found
     } else {
-        println!("Use {} to toggle, {} to confirm:\n", "Space".cyan(), "Enter".cyan());
-
-        match MultiSelect::new()
-            .items(&items)
-            .defaults(&defaults)
-            .interact()
-        {
-            Ok(indices) => indices,
+        let selector = GroupedSelector::new(found);
+        match selector.run() {
+            Ok(selected) => selected,
             Err(_) => {
-                println!("\n{}", "Cancelled.".yellow());
+                println!("{}", "Cancelled.".yellow());
                 return;
             }
         }
     };
 
-    if selected_indices.is_empty() {
-        println!("\n{}", "Nothing selected.".yellow());
+    if to_delete.is_empty() {
+        println!("{}", "Nothing selected.".yellow());
         return;
     }
-
-    let to_delete: Vec<FoundDir> = selected_indices
-        .iter()
-        .map(|&i| found[i].clone())
-        .collect();
 
     println!("\n{} {} directories...", "Deleting".red().bold(), to_delete.len());
 
