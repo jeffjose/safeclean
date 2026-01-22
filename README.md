@@ -1,7 +1,14 @@
 # safeclean
 
-A utility to safely clean up files.
+Clean up build artifacts and dependency caches.
 
-## License
+```bash
+safeclean                # scan current dir, interactive selection
+safeclean ~/projects     # scan specific path
+safeclean --rust         # only Rust target/ dirs
+safeclean --node         # only node_modules/
+safeclean -n             # dry run
+safeclean -y             # skip confirmation
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Supports: Rust, Node.js, Python, Java/Maven, Gradle, .NET, Next.js, Nuxt.js
