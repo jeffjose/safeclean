@@ -274,8 +274,8 @@ impl App<'_> {
         };
         let (checkbox, checkbox_style) = match node.picked {
             0 => ("[ ]", Style::new().dim()),
-            n if n == node.count => ("[✓]", Style::new().green()),
-            _ => ("[~]", Style::new().yellow()),
+            n if n == node.count => ("[x]", Style::new().green()),
+            _ => ("[-]", Style::new().yellow()),
         };
         let meta = match (node.leaf, node.picked) {
             // A type header already says what its leaves are.
