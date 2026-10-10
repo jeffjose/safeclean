@@ -21,7 +21,7 @@ const BAR_WIDTH: usize = 10;
 const KEYS: &[(&str, &str)] = &[
     ("↑↓", "move"),
     ("←→", "fold"),
-    ("space", "select"),
+    ("space/x", "select"),
     ("a", "all"),
     ("e", "expand"),
     ("s", "sort"),
@@ -43,6 +43,8 @@ struct App<'a> {
     /// Rows visible in the list, as of the last draw.
     height: usize,
     confirming: bool,
+    /// Which button has focus in the confirmation dialog.
+    confirm_delete: bool,
     /// Stalest first rather than biggest first.
     by_age: bool,
     notice: Option<&'static str>,
@@ -67,6 +69,7 @@ pub fn run(items: &[Found], root: &str, disk: Option<Disk>, dry: bool) -> io::Re
         total: items.iter().map(|f| f.size).sum(),
         height: 1,
         confirming: false,
+        confirm_delete: false,
         by_age: false,
         notice: None,
     };
@@ -168,7 +171,12 @@ impl App<'_> {
         if self.confirming {
             match key.code {
                 KeyCode::Char('y' | 'Y') => return Some(Action::Delete),
-                _ => self.confirming = false,
+                KeyCode::Enter if self.confirm_delete => return Some(Action::Delete),
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('h' | 'l') => {
+                    self.confirm_delete = !self.confirm_delete;
+                }
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => self.confirming = false,
+                _ => {}
             }
             return None;
         }
@@ -195,7 +203,7 @@ impl App<'_> {
                 let expand = !self.tree().all_expanded();
                 self.tree().set_all_expanded(expand);
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ' | 'x') => {
                 let tree = &self.trees[self.view];
                 let leaves = tree.leaves(tree.current());
                 self.set_picked(&leaves);
@@ -210,6 +218,8 @@ impl App<'_> {
                     self.notice = Some("Nothing selected yet. Press space to select.");
                 } else {
                     self.confirming = true;
+                    // Start on the harmless choice.
+                    self.confirm_delete = false;
                 }
             }
             _ => {}
@@ -374,7 +384,7 @@ impl App<'_> {
     fn draw_confirm(&self, frame: &mut Frame) {
         let area = frame.area();
         let width = 54.min(area.width.saturating_sub(2));
-        let height = 7.min(area.height);
+        let height = 9.min(area.height);
         let popup = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -382,6 +392,13 @@ impl App<'_> {
             height,
         );
 
+        let button = |label: &'static str, focused: bool, color: Color| {
+                if focused {
+                    Span::styled(format!("  {label}  "), Style::new().fg(color).add_modifier(Modifier::REVERSED | Modifier::BOLD))
+                } else {
+                    Span::styled(format!("  {label}  "), Style::new().dim())
+                }
+            };
         let count = self.picked_count();
         let noun = if count == 1 { "item" } else { "items" };
         let text = vec![
@@ -395,7 +412,13 @@ impl App<'_> {
             ]),
             Line::from(if self.dry { "dry run, nothing is deleted" } else { "This cannot be undone." }.dim()),
             Line::raw(""),
-            Line::from(vec![" y ".reversed().bold(), " delete    ".into(), " n ".reversed(), " cancel".into()]),
+            Line::from(vec![
+                button("Cancel", !self.confirm_delete, Color::Reset),
+                "   ".into(),
+                button("Delete", self.confirm_delete, Color::Red),
+            ]),
+            Line::raw(""),
+            Line::from("←→ choose · enter confirm · y/n".dim()),
         ];
         let block = Block::bordered()
             .border_type(BorderType::Rounded)

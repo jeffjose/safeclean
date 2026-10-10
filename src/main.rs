@@ -319,39 +319,64 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let width = chosen.iter().map(|&i| found[i].rel.display().to_string().chars().count()).max().unwrap_or(0).min(60);
-    let mut freed: u64 = 0;
-    let mut deleted = 0;
-    let mut failed = 0;
-    for &i in &chosen {
+    // Per-item lines would scroll the result away, so show progress in
+    // place and summarise by kind afterwards.
+    let progress = io::stderr().is_terminal();
+    let mut freed: Vec<(ProjectType, usize, u64)> = Vec::new();
+    let mut failures: Vec<(&Found, io::Error)> = Vec::new();
+    for (done, &i) in chosen.iter().enumerate() {
         let item = &found[i];
+        if progress {
+            let name: String = item.rel.display().to_string().chars().take(60).collect();
+            eprint!("\r\x1b[2K{} {}/{}  {name}", paint(DIM, "Deleting"), done + 1, chosen.len());
+        }
         match if dry { Ok(()) } else { remove(&item.path) } {
-            Ok(()) => {
-                freed += item.size;
-                deleted += 1;
-                println!("{} {:<width$}  {:>9}", paint(GREEN, "✓"), item.rel.display(), human(item.size));
-            }
-            Err(err) => {
-                failed += 1;
-                println!("{} {:<width$}  {}", paint(RED, "✗"), item.rel.display(), paint(RED, err));
-            }
+            Ok(()) => match freed.iter_mut().find(|(kind, ..)| *kind == item.kind) {
+                Some((_, count, size)) => {
+                    *count += 1;
+                    *size += item.size;
+                }
+                None => freed.push((item.kind, 1, item.size)),
+            },
+            Err(err) => failures.push((item, err)),
         }
     }
+    if progress {
+        eprint!("\r\x1b[2K");
+    }
+    freed.sort_by_key(|&(_, _, size)| std::cmp::Reverse(size));
 
+    let deleted: usize = freed.iter().map(|&(_, count, _)| count).sum();
+    let total: u64 = freed.iter().map(|&(_, _, size)| size).sum();
     let now_free = match (dry, disk) {
-        (true, Some(before)) => Some(before.free + freed),
+        (true, Some(before)) => Some(before.free + total),
         (false, Some(_)) => Disk::of(&root).map(|after| after.free),
         _ => None,
     };
 
-    println!();
     let headline = if dry { "Dry run, would have freed" } else { "Freed" };
-    println!("{headline} {} in {deleted} {}", paint(GREEN, paint(BOLD, human(freed))), plural(deleted));
+    println!("{headline} {} in {deleted} {}", paint(GREEN, paint(BOLD, human(total))), plural(deleted));
+    if !freed.is_empty() {
+        println!();
+    }
+    let width = freed.iter().map(|(kind, ..)| kind.name().len()).max().unwrap_or(0);
+    for (kind, count, size) in &freed {
+        println!(
+            "  {:<width$}  {}  {:>9}",
+            kind.name(),
+            paint(DIM, format!("{count:>5} {:<5}", plural(*count))),
+            human(*size)
+        );
+    }
     if let (Some(before), Some(now)) = (disk, now_free) {
         print_disk(before, now);
     }
-    if failed > 0 {
-        println!("{}", paint(RED, format!("Failed to delete {failed} {}", plural(failed))));
+    if !failures.is_empty() {
+        println!();
+        println!("{}", paint(RED, format!("Could not delete {} {}", failures.len(), plural(failures.len()))));
+        for (item, err) in &failures {
+            println!("  {}  {}", item.rel.display(), paint(DIM, err));
+        }
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
