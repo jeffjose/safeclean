@@ -1,196 +1,162 @@
+use clap::ValueEnum;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum ProjectType {
     Rust,
+    #[value(alias = "js", alias = "npm")]
     Node,
+    /// Framework build caches: .next, .nuxt, .svelte-kit, .turbo, ...
+    Web,
+    #[value(alias = "py")]
     Python,
-    JavaMaven,
+    #[value(alias = "java")]
+    Maven,
     Gradle,
-    DotNet,
-    NextJs,
-    NuxtJs,
+    #[value(alias = "csharp")]
+    Dotnet,
+    Zig,
+    Elixir,
+    Swift,
+    Haskell,
+    Dart,
+    Terraform,
 }
 
 impl ProjectType {
-    pub fn name(&self) -> &'static str {
+    pub const ALL: &[ProjectType] = &[
+        ProjectType::Rust,
+        ProjectType::Node,
+        ProjectType::Web,
+        ProjectType::Python,
+        ProjectType::Maven,
+        ProjectType::Gradle,
+        ProjectType::Dotnet,
+        ProjectType::Zig,
+        ProjectType::Elixir,
+        ProjectType::Swift,
+        ProjectType::Haskell,
+        ProjectType::Dart,
+        ProjectType::Terraform,
+    ];
+
+    pub fn name(self) -> &'static str {
         match self {
             ProjectType::Rust => "Rust",
             ProjectType::Node => "Node.js",
+            ProjectType::Web => "Web caches",
             ProjectType::Python => "Python",
-            ProjectType::JavaMaven => "Java (Maven)",
+            ProjectType::Maven => "Java (Maven)",
             ProjectType::Gradle => "Gradle",
-            ProjectType::DotNet => ".NET",
-            ProjectType::NextJs => "Next.js",
-            ProjectType::NuxtJs => "Nuxt.js",
+            ProjectType::Dotnet => ".NET",
+            ProjectType::Zig => "Zig",
+            ProjectType::Elixir => "Elixir",
+            ProjectType::Swift => "Swift",
+            ProjectType::Haskell => "Haskell",
+            ProjectType::Dart => "Dart",
+            ProjectType::Terraform => "Terraform",
         }
     }
-
-    pub fn all() -> Vec<ProjectType> {
-        vec![
-            ProjectType::Rust,
-            ProjectType::Node,
-            ProjectType::Python,
-            ProjectType::JavaMaven,
-            ProjectType::Gradle,
-            ProjectType::DotNet,
-            ProjectType::NextJs,
-            ProjectType::NuxtJs,
-        ]
-    }
 }
 
-pub struct CleanableDir {
-    pub dir_name: &'static str,
-    pub project_type: ProjectType,
-    pub validator: fn(&Path) -> bool,
+/// What has to be true for a directory with a matching name to count.
+enum Marker {
+    /// The name alone is unambiguous.
+    Always,
+    /// One of these files sits next to the directory. A leading or trailing
+    /// `*` matches any suffix/prefix.
+    Sibling(&'static [&'static str]),
+    /// The directory itself contains this file.
+    Contains(&'static str),
 }
 
-fn has_sibling(path: &Path, filename: &str) -> bool {
-    path.parent()
-        .map(|p| p.join(filename).exists())
-        .unwrap_or(false)
+struct Rule {
+    dir: &'static str,
+    kind: ProjectType,
+    marker: Marker,
 }
 
-fn has_sibling_matching(path: &Path, pattern: &str) -> bool {
-    let Some(parent) = path.parent() else {
+const fn rule(dir: &'static str, kind: ProjectType, marker: Marker) -> Rule {
+    Rule { dir, kind, marker }
+}
+
+use Marker::{Always, Contains, Sibling};
+use ProjectType::*;
+
+// Order matters where a name is shared (target, build): first match wins.
+const RULES: &[Rule] = &[
+    rule("target", Rust, Sibling(&["Cargo.toml"])),
+    rule("node_modules", Node, Always),
+    rule(".next", Web, Sibling(&["next.config*", "package.json"])),
+    rule(".nuxt", Web, Sibling(&["nuxt.config*", "package.json"])),
+    rule(".svelte-kit", Web, Sibling(&["svelte.config*", "package.json"])),
+    rule(".turbo", Web, Sibling(&["package.json"])),
+    rule(".parcel-cache", Web, Always),
+    rule(".angular", Web, Sibling(&["angular.json"])),
+    rule(".venv", Python, Contains("pyvenv.cfg")),
+    rule("venv", Python, Contains("pyvenv.cfg")),
+    rule("__pycache__", Python, Always),
+    rule(".pytest_cache", Python, Always),
+    rule(".mypy_cache", Python, Always),
+    rule(".ruff_cache", Python, Always),
+    rule(".tox", Python, Always),
+    rule("target", Maven, Sibling(&["pom.xml"])),
+    rule("build", Gradle, Sibling(&["build.gradle", "build.gradle.kts"])),
+    rule(
+        ".gradle",
+        Gradle,
+        Sibling(&["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]),
+    ),
+    rule("bin", Dotnet, Sibling(&["*.csproj", "*.fsproj", "*.vbproj"])),
+    rule("obj", Dotnet, Sibling(&["*.csproj", "*.fsproj", "*.vbproj"])),
+    rule(".zig-cache", Zig, Sibling(&["build.zig"])),
+    rule("zig-cache", Zig, Sibling(&["build.zig"])),
+    rule("zig-out", Zig, Sibling(&["build.zig"])),
+    rule("_build", Elixir, Sibling(&["mix.exs"])),
+    rule("deps", Elixir, Sibling(&["mix.exs"])),
+    rule(".build", Swift, Sibling(&["Package.swift"])),
+    rule("dist-newstyle", Haskell, Always),
+    rule(".stack-work", Haskell, Always),
+    rule(".dart_tool", Dart, Sibling(&["pubspec.yaml"])),
+    rule("build", Dart, Sibling(&["pubspec.yaml"])),
+    rule(".terraform", Terraform, Always),
+];
+
+fn has_sibling(dir: &Path, patterns: &[&str]) -> bool {
+    let Some(parent) = dir.parent() else {
         return false;
     };
+    let (globs, exact): (Vec<&str>, Vec<&str>) = patterns.iter().partition(|p| p.contains('*'));
+    if exact.iter().any(|name| parent.join(name).exists()) {
+        return true;
+    }
+    if globs.is_empty() {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(parent) else {
         return false;
     };
-    entries.filter_map(|e| e.ok()).any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .map(|name| name.starts_with(pattern))
-            .unwrap_or(false)
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        globs.iter().any(|glob| match glob.strip_prefix('*') {
+            Some(suffix) => name.ends_with(suffix),
+            None => name.starts_with(glob.trim_end_matches('*')),
+        })
     })
 }
 
-fn always_valid(_: &Path) -> bool {
-    true
-}
-
-fn validate_rust(path: &Path) -> bool {
-    has_sibling(path, "Cargo.toml")
-}
-
-fn validate_node(path: &Path) -> bool {
-    has_sibling(path, "package.json")
-}
-
-fn validate_maven(path: &Path) -> bool {
-    has_sibling(path, "pom.xml")
-}
-
-fn validate_gradle(path: &Path) -> bool {
-    has_sibling(path, "build.gradle") || has_sibling(path, "build.gradle.kts")
-}
-
-fn validate_dotnet(path: &Path) -> bool {
-    has_sibling_matching(path, ".csproj")
-        || has_sibling_matching(path, ".fsproj")
-        || has_sibling_matching(path, ".sln")
-}
-
-fn validate_nextjs(path: &Path) -> bool {
-    has_sibling_matching(path, "next.config")
-}
-
-fn validate_nuxtjs(path: &Path) -> bool {
-    has_sibling_matching(path, "nuxt.config")
-}
-
-pub fn get_cleanable_dirs() -> Vec<CleanableDir> {
-    vec![
-        // Rust
-        CleanableDir {
-            dir_name: "target",
-            project_type: ProjectType::Rust,
-            validator: validate_rust,
-        },
-        // Node.js
-        CleanableDir {
-            dir_name: "node_modules",
-            project_type: ProjectType::Node,
-            validator: validate_node,
-        },
-        // Python
-        CleanableDir {
-            dir_name: ".venv",
-            project_type: ProjectType::Python,
-            validator: always_valid,
-        },
-        CleanableDir {
-            dir_name: "venv",
-            project_type: ProjectType::Python,
-            validator: always_valid,
-        },
-        CleanableDir {
-            dir_name: "__pycache__",
-            project_type: ProjectType::Python,
-            validator: always_valid,
-        },
-        CleanableDir {
-            dir_name: ".pytest_cache",
-            project_type: ProjectType::Python,
-            validator: always_valid,
-        },
-        CleanableDir {
-            dir_name: ".mypy_cache",
-            project_type: ProjectType::Python,
-            validator: always_valid,
-        },
-        CleanableDir {
-            dir_name: ".ruff_cache",
-            project_type: ProjectType::Python,
-            validator: always_valid,
-        },
-        CleanableDir {
-            dir_name: ".tox",
-            project_type: ProjectType::Python,
-            validator: always_valid,
-        },
-        // Java (Maven)
-        CleanableDir {
-            dir_name: "target",
-            project_type: ProjectType::JavaMaven,
-            validator: validate_maven,
-        },
-        // Gradle
-        CleanableDir {
-            dir_name: "build",
-            project_type: ProjectType::Gradle,
-            validator: validate_gradle,
-        },
-        CleanableDir {
-            dir_name: ".gradle",
-            project_type: ProjectType::Gradle,
-            validator: validate_gradle,
-        },
-        // .NET
-        CleanableDir {
-            dir_name: "bin",
-            project_type: ProjectType::DotNet,
-            validator: validate_dotnet,
-        },
-        CleanableDir {
-            dir_name: "obj",
-            project_type: ProjectType::DotNet,
-            validator: validate_dotnet,
-        },
-        // Next.js
-        CleanableDir {
-            dir_name: ".next",
-            project_type: ProjectType::NextJs,
-            validator: validate_nextjs,
-        },
-        // Nuxt.js
-        CleanableDir {
-            dir_name: ".nuxt",
-            project_type: ProjectType::NuxtJs,
-            validator: validate_nuxtjs,
-        },
-    ]
+/// Returns the project type `path` is a cleanable artifact of, if any.
+pub fn classify(path: &Path, name: &str) -> Option<ProjectType> {
+    RULES
+        .iter()
+        .filter(|rule| rule.dir == name)
+        .find(|rule| match rule.marker {
+            Always => true,
+            Sibling(patterns) => has_sibling(path, patterns),
+            Contains(file) => path.join(file).exists(),
+        })
+        .map(|rule| rule.kind)
 }

@@ -1,357 +1,299 @@
-mod cleaner;
 mod projects;
 mod scanner;
-mod selector;
+mod tree;
+mod tui;
 
 use clap::Parser;
-use colored::Colorize;
-use indicatif::{ProgressBar, ProgressStyle};
 use projects::ProjectType;
-use scanner::FoundDir;
-use selector::GroupedSelector;
+use scanner::{Disk, Found, Progress, human};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::fmt::Display;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::{env, fs, thread};
 
 #[derive(Parser)]
-#[command(name = "safeclean")]
-#[command(about = "Safely clean up build artifacts and dependency caches to reclaim disk space")]
-#[command(version)]
+#[command(name = "safeclean", version)]
+#[command(about = "Find and delete build artifacts and dependency caches to reclaim disk space")]
 struct Cli {
-    /// Directory to scan (defaults to current directory)
+    /// Directory to scan
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Show what would be deleted without deleting
+    /// Only look for these project types (repeatable or comma-separated)
+    #[arg(short = 't', long = "type", value_enum, value_delimiter = ',', value_name = "TYPE")]
+    types: Vec<ProjectType>,
+
+    /// List what was found without deleting anything
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Clean Rust target/ directories
-    #[arg(long)]
-    rust: bool,
-
-    /// Clean Node.js node_modules/
-    #[arg(long, visible_alias = "js", visible_alias = "npm")]
-    node: bool,
-
-    /// Clean Python venvs and caches
-    #[arg(long, visible_alias = "py")]
-    python: bool,
-
-    /// Clean Java Maven target/
-    #[arg(long, visible_alias = "maven")]
-    java: bool,
-
-    /// Clean Gradle build/ directories
-    #[arg(long)]
-    gradle: bool,
-
-    /// Clean .NET bin/ and obj/ directories
-    #[arg(long, visible_alias = "csharp")]
-    dotnet: bool,
-
-    /// Clean Next.js .next/ directories
-    #[arg(long)]
-    next: bool,
-
-    /// Clean Nuxt.js .nuxt/ directories
-    #[arg(long)]
-    nuxt: bool,
-
-    /// Skip confirmation prompt
-    #[arg(short = 'y', long)]
+    /// Delete everything found without asking
+    #[arg(short = 'y', long, conflicts_with = "dry_run")]
     yes: bool,
 
-    /// Demo mode - show UI with simulated data (nothing is deleted)
+    /// Estimate sizes by sampling large directories instead of measuring every file
+    #[arg(long)]
+    fast: bool,
+
+    /// Show the UI with simulated data (nothing is deleted)
     #[arg(long)]
     demo: bool,
 }
 
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
+static COLOR: AtomicBool = AtomicBool::new(false);
 
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
+const BOLD: &str = "1";
+const DIM: &str = "2";
+const RED: &str = "31";
+const GREEN: &str = "32";
+
+/// Wraps `text` in an SGR sequence when stdout is a colour terminal.
+fn paint(code: &str, text: impl Display) -> String {
+    if COLOR.load(Ordering::Relaxed) {
+        format!("\x1b[{code}m{text}\x1b[0m")
     } else {
-        format!("{} B", bytes)
+        text.to_string()
     }
 }
 
-fn get_enabled_types(cli: &Cli) -> HashSet<ProjectType> {
-    let any_specified =
-        cli.rust || cli.node || cli.python || cli.java || cli.gradle || cli.dotnet || cli.next || cli.nuxt;
-
-    if !any_specified {
-        return ProjectType::all().into_iter().collect();
-    }
-
-    let mut types = HashSet::new();
-    if cli.rust {
-        types.insert(ProjectType::Rust);
-    }
-    if cli.node {
-        types.insert(ProjectType::Node);
-    }
-    if cli.python {
-        types.insert(ProjectType::Python);
-    }
-    if cli.java {
-        types.insert(ProjectType::JavaMaven);
-    }
-    if cli.gradle {
-        types.insert(ProjectType::Gradle);
-    }
-    if cli.dotnet {
-        types.insert(ProjectType::DotNet);
-    }
-    if cli.next {
-        types.insert(ProjectType::NextJs);
-    }
-    if cli.nuxt {
-        types.insert(ProjectType::NuxtJs);
-    }
-    types
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "directory" } else { "directories" }
 }
 
-fn generate_demo_data() -> Vec<FoundDir> {
-    vec![
-        // Rust projects
-        FoundDir {
-            path: "/home/user/projects/api-server/target".into(),
-            project_type: ProjectType::Rust,
-            size_bytes: 1_892_000_000, // 1.9 GB
-        },
-        FoundDir {
-            path: "/home/user/projects/cli-tool/target".into(),
-            project_type: ProjectType::Rust,
-            size_bytes: 456_000_000, // 456 MB
-        },
-        FoundDir {
-            path: "/home/user/projects/utils/target".into(),
-            project_type: ProjectType::Rust,
-            size_bytes: 234_000_000, // 234 MB
-        },
-        // Node.js projects
-        FoundDir {
-            path: "/home/user/projects/webapp/node_modules".into(),
-            project_type: ProjectType::Node,
-            size_bytes: 892_000_000, // 892 MB
-        },
-        FoundDir {
-            path: "/home/user/projects/dashboard/node_modules".into(),
-            project_type: ProjectType::Node,
-            size_bytes: 654_000_000, // 654 MB
-        },
-        FoundDir {
-            path: "/home/user/projects/blog/node_modules".into(),
-            project_type: ProjectType::Node,
-            size_bytes: 423_000_000, // 423 MB
-        },
-        FoundDir {
-            path: "/home/user/projects/portfolio/node_modules".into(),
-            project_type: ProjectType::Node,
-            size_bytes: 312_000_000, // 312 MB
-        },
-        // Python projects
-        FoundDir {
-            path: "/home/user/projects/ml-pipeline/.venv".into(),
-            project_type: ProjectType::Python,
-            size_bytes: 1_234_000_000, // 1.2 GB
-        },
-        FoundDir {
-            path: "/home/user/projects/data-analysis/.venv".into(),
-            project_type: ProjectType::Python,
-            size_bytes: 567_000_000, // 567 MB
-        },
-        FoundDir {
-            path: "/home/user/projects/scripts/__pycache__".into(),
-            project_type: ProjectType::Python,
-            size_bytes: 12_000_000, // 12 MB
-        },
-        // Next.js
-        FoundDir {
-            path: "/home/user/projects/webapp/.next".into(),
-            project_type: ProjectType::NextJs,
-            size_bytes: 345_000_000, // 345 MB
-        },
-        // Gradle
-        FoundDir {
-            path: "/home/user/projects/android-app/build".into(),
-            project_type: ProjectType::Gradle,
-            size_bytes: 789_000_000, // 789 MB
-        },
-        FoundDir {
-            path: "/home/user/projects/android-app/.gradle".into(),
-            project_type: ProjectType::Gradle,
-            size_bytes: 234_000_000, // 234 MB
-        },
+fn tilde(path: &Path) -> String {
+    if let Some(home) = env::var_os("HOME")
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return Path::new("~").join(rest).display().to_string();
+    }
+    path.display().to_string()
+}
+
+fn demo_data(enabled: &HashSet<ProjectType>) -> (PathBuf, Vec<Found>) {
+    use ProjectType::*;
+    const MB: u64 = 1_000_000;
+    let root = PathBuf::from("/home/user/projects");
+    let found = [
+        ("api-server/target", Rust, 1_892 * MB),
+        ("cli-tool/target", Rust, 456 * MB),
+        ("experiments/parsers/json/target", Rust, 234 * MB),
+        ("monorepo/node_modules", Node, 892 * MB),
+        ("monorepo/apps/web/node_modules", Node, 654 * MB),
+        ("monorepo/apps/web/.next", Web, 345 * MB),
+        ("monorepo/apps/docs/node_modules", Node, 212 * MB),
+        ("monorepo/apps/docs/.svelte-kit", Web, 48 * MB),
+        ("monorepo/packages/ui/node_modules", Node, 97 * MB),
+        ("blog/node_modules", Node, 423 * MB),
+        ("ml-pipeline/.venv", Python, 1_234 * MB),
+        ("ml-pipeline/src/__pycache__", Python, 3 * MB),
+        ("ml-pipeline/src/models/__pycache__", Python, 9 * MB),
+        ("ml-pipeline/.pytest_cache", Python, MB / 4),
+        ("data-analysis/.venv", Python, 567 * MB),
+        ("android-app/build", Gradle, 789 * MB),
+        ("android-app/.gradle", Gradle, 234 * MB),
+        ("infra/staging/.terraform", Terraform, 310 * MB),
     ]
+    .into_iter()
+    .filter(|(_, kind, _)| enabled.contains(kind))
+    .map(|(rel, kind, size)| Found { path: root.join(rel), rel: rel.into(), kind, size })
+    .collect();
+    (root, found)
 }
 
-fn group_by_type(dirs: &[FoundDir]) -> Vec<(ProjectType, Vec<&FoundDir>)> {
-    let mut grouped: std::collections::HashMap<ProjectType, Vec<&FoundDir>> =
-        std::collections::HashMap::new();
+/// Runs the scan on a worker thread, showing live progress on stderr.
+fn scan_with_spinner(root: &Path, enabled: &HashSet<ProjectType>, fast: bool) -> Vec<Found> {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let progress = Progress::default();
+    let animate = io::stderr().is_terminal();
 
-    for dir in dirs {
-        grouped.entry(dir.project_type).or_default().push(dir);
-    }
-
-    let type_order = ProjectType::all();
-    let mut result: Vec<(ProjectType, Vec<&FoundDir>)> = Vec::new();
-
-    for pt in type_order {
-        if let Some(dirs) = grouped.remove(&pt) {
-            result.push((pt, dirs));
+    thread::scope(|scope| {
+        let worker = scope.spawn(|| scanner::scan(root, enabled, fast, &progress));
+        let mut stderr = io::stderr();
+        let mut tick = 0;
+        while animate && !worker.is_finished() {
+            let _ = write!(
+                stderr,
+                "\r\x1b[2K{} Scanning {} · {} found, {}",
+                FRAMES[tick % FRAMES.len()],
+                tilde(root),
+                progress.found.load(Ordering::Relaxed),
+                human(progress.bytes.load(Ordering::Relaxed)),
+            );
+            let _ = stderr.flush();
+            tick += 1;
+            thread::sleep(Duration::from_millis(80));
         }
-    }
-
-    result
+        if animate {
+            let _ = write!(stderr, "\r\x1b[2K");
+        }
+        worker.join().expect("scan thread panicked")
+    })
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn print_listing(found: &[Found]) {
+    let width = found.iter().map(|f| f.rel.display().to_string().chars().count()).max().unwrap_or(0);
+    let mut groups: Vec<(ProjectType, Vec<&Found>)> = ProjectType::ALL
+        .iter()
+        .map(|&kind| (kind, found.iter().filter(|f| f.kind == kind).collect::<Vec<_>>()))
+        .filter(|(_, dirs)| !dirs.is_empty())
+        .collect();
+    groups.sort_by_key(|(_, dirs)| std::cmp::Reverse(dirs.iter().map(|f| f.size).sum::<u64>()));
 
-    let found = if cli.demo {
+    for (kind, dirs) in groups {
+        let size: u64 = dirs.iter().map(|f| f.size).sum();
         println!(
-            "{} {}\n",
-            "Demo mode".yellow().bold(),
-            "(simulated data - nothing will be deleted)".dimmed()
+            "{}  {}",
+            paint(BOLD, kind.name()),
+            paint(DIM, format!("{} {}, {}", dirs.len(), plural(dirs.len()), human(size)))
         );
-        generate_demo_data()
+        for dir in dirs {
+            println!("  {:<width$}  {:>9}", dir.rel.display(), human(dir.size));
+        }
+        println!();
+    }
+
+    let total: u64 = found.iter().map(|f| f.size).sum();
+    println!(
+        "{} {} in {} {}",
+        paint(BOLD, "Total:"),
+        paint(GREEN, human(total)),
+        found.len(),
+        plural(found.len())
+    );
+}
+
+/// Shows where the disk stands now: used, just reclaimed, and free.
+fn print_disk(before: Disk, now_free: u64) {
+    const WIDTH: usize = 32;
+    let percent_used = |free: u64| 100.0 * before.total.saturating_sub(free) as f64 / before.total.max(1) as f64;
+    let cells = |bytes: u64| (bytes as f64 / before.total.max(1) as f64 * WIDTH as f64).round() as usize;
+
+    let gained = now_free.saturating_sub(before.free);
+    // Always show at least a sliver for what was reclaimed.
+    let reclaimed = cells(gained).max((gained > 0) as usize).min(WIDTH);
+    let free = cells(before.free).min(WIDTH - reclaimed);
+    let used = WIDTH - reclaimed - free;
+
+    println!();
+    println!(
+        "  {}{}{}  {} disk",
+        "█".repeat(used),
+        paint(GREEN, "█".repeat(reclaimed)),
+        paint(DIM, "░".repeat(free)),
+        human(before.total)
+    );
+    println!("  free  {} → {}", human(before.free), paint(GREEN, paint(BOLD, human(now_free))));
+    println!("  used  {:.0}% → {:.0}%", percent_used(before.free), percent_used(now_free));
+}
+
+fn remove(path: &Path) -> io::Result<()> {
+    // A symlink swapped in since the scan must not be followed.
+    if !fs::symlink_metadata(path)?.is_dir() {
+        return Err(io::Error::other("no longer a directory"));
+    }
+    fs::remove_dir_all(path)
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let interactive = io::stdout().is_terminal() && io::stdin().is_terminal();
+    COLOR.store(io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(), Ordering::Relaxed);
+
+    let enabled: HashSet<ProjectType> = if cli.types.is_empty() {
+        ProjectType::ALL.iter().copied().collect()
     } else {
-        let path = cli.path.canonicalize().unwrap_or_else(|_| {
-            eprintln!("{} Invalid path: {}", "error:".red().bold(), cli.path.display());
-            std::process::exit(1);
-        });
-
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-        );
-        spinner.set_message(format!("Searching for build artifacts in {}", path.display()));
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
-        let enabled_types = get_enabled_types(&cli);
-        let result = scanner::scan(&path, &enabled_types);
-
-        spinner.finish_and_clear();
-        result
+        cli.types.iter().copied().collect()
     };
+
+    let (root, found) = if cli.demo {
+        demo_data(&enabled)
+    } else {
+        let root = match cli.path.canonicalize() {
+            Ok(root) if root.is_dir() => root,
+            _ => {
+                eprintln!("{} not a directory: {}", paint(RED, "error:"), cli.path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let found = scan_with_spinner(&root, &enabled, cli.fast);
+        (root, found)
+    };
+
+    let disk = if cli.demo { Some(Disk { free: 182 << 30, total: 1 << 40 }) } else { Disk::of(&root) };
 
     if found.is_empty() {
-        println!("{}", "No cleanable directories found.".yellow());
-        return;
+        println!("No cleanable directories found in {}", tilde(&root));
+        return ExitCode::SUCCESS;
     }
 
-    let total_size = scanner::total_size(&found);
-    println!(
-        "Found {} cleanable directories ({})\n",
-        found.len().to_string().green().bold(),
-        format_size(total_size).green().bold()
-    );
-
-    if cli.dry_run {
-        println!("{}", "Dry run - nothing will be deleted:\n".yellow());
-        let grouped = group_by_type(&found);
-        for (project_type, dirs) in &grouped {
-            let group_size: u64 = dirs.iter().map(|d| d.size_bytes).sum();
-            println!(
-                "{} {} ({} items, {})",
-                "▼".dimmed(),
-                project_type.name().bold(),
-                dirs.len(),
-                format_size(group_size).green()
-            );
-            for dir in dirs {
-                println!(
-                    "    {}  {:>10}",
-                    dir.path.display(),
-                    dir.size_human()
-                );
-            }
-            println!();
+    let chosen: Vec<usize> = if cli.yes {
+        (0..found.len()).collect()
+    } else if cli.dry_run || !interactive {
+        print_listing(&found);
+        if !cli.dry_run {
+            eprintln!("\nNot a terminal, so nothing was deleted. Pass -y to delete everything listed.");
         }
-        println!(
-            "{} {}",
-            "Total:".bold(),
-            format_size(total_size).green().bold()
-        );
-        return;
-    }
-
-    let to_delete = if cli.yes {
-        found
+        return ExitCode::SUCCESS;
     } else {
-        let selector = GroupedSelector::new(found);
-        match selector.run() {
-            Ok(selected) => selected,
-            Err(_) => {
-                println!("{}", "Cancelled.".yellow());
-                return;
+        match tui::run(&found, &tilde(&root), disk, cli.demo) {
+            Ok(chosen) => chosen,
+            Err(err) => {
+                eprintln!("{} {err}", paint(RED, "error:"));
+                return ExitCode::FAILURE;
             }
         }
     };
 
-    if to_delete.is_empty() {
-        println!("{}", "Nothing selected.".yellow());
-        return;
+    if chosen.is_empty() {
+        println!("Nothing deleted.");
+        return ExitCode::SUCCESS;
     }
 
-    if cli.demo {
-        // Demo mode - just show what would be deleted
-        let total: u64 = to_delete.iter().map(|d| d.size_bytes).sum();
-        println!(
-            "\n{} Would delete {} directories ({}):",
-            "Demo:".yellow().bold(),
-            to_delete.len().to_string().green(),
-            format_size(total).green().bold()
-        );
-        let grouped = group_by_type(&to_delete);
-        for (project_type, dirs) in &grouped {
-            let group_size: u64 = dirs.iter().map(|d| d.size_bytes).sum();
-            println!(
-                "\n  {} ({} items, {})",
-                project_type.name().bold(),
-                dirs.len(),
-                format_size(group_size).green()
-            );
-            for dir in dirs {
-                println!("    {} {:>10}", dir.path.display(), dir.size_human());
+    let width = chosen.iter().map(|&i| found[i].rel.display().to_string().chars().count()).max().unwrap_or(0);
+    let mut freed: u64 = 0;
+    let mut deleted = 0;
+    let mut failed = 0;
+    for &i in &chosen {
+        let dir = &found[i];
+        match if cli.demo { Ok(()) } else { remove(&dir.path) } {
+            Ok(()) => {
+                freed += dir.size;
+                deleted += 1;
+                println!("{} {:<width$}  {:>9}", paint(GREEN, "✓"), dir.rel.display(), human(dir.size));
+            }
+            Err(err) => {
+                failed += 1;
+                println!("{} {:<width$}  {}", paint(RED, "✗"), dir.rel.display(), paint(RED, err));
             }
         }
-        println!(
-            "\n{} {}",
-            "Nothing was deleted - this is a demo.".yellow(),
-            "Run without --demo to actually clean.".dimmed()
-        );
-        return;
     }
 
-    println!("\n{} {} directories...", "Deleting".red().bold(), to_delete.len());
-
-    let result = cleaner::clean(to_delete);
-
-    if !result.failed.is_empty() {
-        println!("\n{}", "Failed to delete:".red());
-        for (dir, err) in &result.failed {
-            println!("  {} - {}", dir.path.display(), err);
-        }
+    // What the filesystem reports is the truth; the per-directory sizes are
+    // only what we expected to get back.
+    let now_free = match (cli.demo, disk) {
+        (true, Some(before)) => Some(before.free + freed),
+        (false, Some(_)) => Disk::of(&root).map(|after| after.free),
+        _ => None,
+    };
+    if let (Some(before), Some(now)) = (disk, now_free)
+        && now > before.free
+    {
+        freed = now - before.free;
     }
 
-    if !result.deleted.is_empty() {
-        println!(
-            "\n{} Cleaned {} in {} directories",
-            "Done!".green().bold(),
-            format_size(result.total_cleaned()).green().bold(),
-            result.deleted.len().to_string().green()
-        );
+    println!();
+    let headline = if cli.demo { "Demo, would have freed" } else { "Freed" };
+    println!("{headline} {} in {deleted} {}", paint(GREEN, paint(BOLD, human(freed))), plural(deleted));
+    if let (Some(before), Some(now)) = (disk, now_free) {
+        print_disk(before, now);
     }
+    if failed > 0 {
+        println!("{}", paint(RED, format!("Failed to delete {failed} {}", plural(failed))));
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }

@@ -1,92 +1,169 @@
-use crate::projects::{get_cleanable_dirs, ProjectType};
+use crate::projects::{self, ProjectType};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
-pub struct FoundDir {
+pub struct Found {
     pub path: PathBuf,
-    pub project_type: ProjectType,
-    pub size_bytes: u64,
+    /// Path relative to the scan root, used for display.
+    pub rel: PathBuf,
+    pub kind: ProjectType,
+    pub size: u64,
 }
 
-impl FoundDir {
-    pub fn size_human(&self) -> String {
-        format_size(self.size_bytes)
+/// Live counters a caller can poll while a scan runs on another thread.
+#[derive(Default)]
+pub struct Progress {
+    pub found: AtomicUsize,
+    pub bytes: AtomicU64,
+}
+
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
     }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
+/// Space actually occupied on disk, like `du`, rather than apparent length.
+#[cfg(unix)]
+fn disk_usage(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks() * 512
+}
 
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
+#[cfg(not(unix))]
+fn disk_usage(meta: &std::fs::Metadata) -> u64 {
+    meta.len()
+}
+
+/// With `--fast`, directories holding more files than this have only this
+/// many measured; the rest are assumed to average the same.
+const FILE_SAMPLE: usize = 64;
+
+/// What a directory entry itself occupies, near enough, without a stat.
+const DIR_BLOCK: u64 = 4096;
+
+/// Disk usage of everything under `path`, walked in parallel.
+fn dir_size(path: &Path, fast: bool) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dirs.push(entry.path()),
+            Ok(_) => files.push(entry),
+            Err(_) => {}
+        }
+    }
+
+    let measure = |file: &std::fs::DirEntry| file.metadata().map_or(0, |m| disk_usage(&m));
+    let own = if fast && files.len() > FILE_SAMPLE {
+        // Listing order is effectively random, so evenly spaced picks are a
+        // fair sample.
+        let step = files.len() as f64 / FILE_SAMPLE as f64;
+        let sum: u64 = (0..FILE_SAMPLE).map(|i| measure(&files[(i as f64 * step) as usize])).sum();
+        (sum as f64 * step) as u64
     } else {
-        format!("{} B", bytes)
-    }
+        files.iter().map(measure).sum()
+    };
+    DIR_BLOCK + own + dirs.par_iter().map(|dir| dir_size(dir, fast)).sum::<u64>()
 }
 
-fn dir_size(path: &Path) -> u64 {
-    WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+#[cfg(unix)]
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev())
 }
 
-pub fn scan(root: &Path, enabled_types: &HashSet<ProjectType>) -> Vec<FoundDir> {
-    let cleanable_dirs = get_cleanable_dirs();
-    let mut found: Vec<FoundDir> = Vec::new();
-    let mut skip_prefixes: Vec<PathBuf> = Vec::new();
+#[cfg(not(unix))]
+fn device(_: &Path) -> Option<u64> {
+    None
+}
 
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_dir() {
-            continue;
-        }
+struct Search<'a> {
+    enabled: &'a HashSet<ProjectType>,
+    device: Option<u64>,
+    progress: &'a Progress,
+    hits: Mutex<Vec<(PathBuf, ProjectType)>>,
+}
 
-        let path = entry.path();
-
-        // Skip if inside a previously found cleanable dir
-        if skip_prefixes.iter().any(|prefix| path.starts_with(prefix)) {
-            continue;
-        }
-
-        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
+impl Search<'_> {
+    fn walk(&self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
-
-        // Check against each cleanable directory pattern
-        for cleanable in &cleanable_dirs {
-            if !enabled_types.contains(&cleanable.project_type) {
+        let mut descend = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-
-            if dir_name == cleanable.dir_name && (cleanable.validator)(path) {
-                let size_bytes = dir_size(path);
-                found.push(FoundDir {
-                    path: path.to_path_buf(),
-                    project_type: cleanable.project_type,
-                    size_bytes,
-                });
-                skip_prefixes.push(path.to_path_buf());
-                break;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            // Never look for artifacts inside an artifact, wanted or not.
+            match projects::classify(&path, name) {
+                Some(kind) if self.enabled.contains(&kind) => {
+                    self.progress.found.fetch_add(1, Ordering::Relaxed);
+                    self.hits.lock().unwrap().push((path, kind));
+                }
+                Some(_) => {}
+                None => descend.push(path),
             }
         }
+        descend
+            .par_iter()
+            // Stay on the filesystem the scan started on.
+            .filter(|path| self.device.is_none() || device(path) == self.device)
+            .for_each(|path| self.walk(path));
     }
+}
 
-    // Sort by size descending
-    found.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+pub fn scan(root: &Path, enabled: &HashSet<ProjectType>, fast: bool, progress: &Progress) -> Vec<Found> {
+    let search = Search { enabled, device: device(root), progress, hits: Mutex::new(Vec::new()) };
+    search.walk(root);
+
+    let mut found: Vec<Found> = search
+        .hits
+        .into_inner()
+        .unwrap()
+        .into_par_iter()
+        .map(|(path, kind)| {
+            let size = dir_size(&path, fast);
+            progress.bytes.fetch_add(size, Ordering::Relaxed);
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            Found { path, rel, kind, size }
+        })
+        .collect();
+
+    found.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
     found
 }
 
-pub fn total_size(dirs: &[FoundDir]) -> u64 {
-    dirs.iter().map(|d| d.size_bytes).sum()
+/// Space on the filesystem holding the scan root.
+#[derive(Clone, Copy)]
+pub struct Disk {
+    pub free: u64,
+    pub total: u64,
+}
+
+impl Disk {
+    pub fn of(path: &Path) -> Option<Disk> {
+        Some(Disk { free: fs4::available_space(path).ok()?, total: fs4::total_space(path).ok()? })
+    }
 }
