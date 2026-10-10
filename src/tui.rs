@@ -20,13 +20,13 @@ const BAR_WIDTH: usize = 8;
 
 const KEYS: &[(&str, &str)] = &[
     ("↑↓", "move"),
-    ("←→", "fold"),
-    ("space/x", "select"),
+    ("enter", "fold"),
+    ("x", "select"),
     ("a", "all"),
     ("e", "expand"),
     ("s", "sort"),
     ("tab", "view"),
-    ("enter", "delete"),
+    ("d", "delete"),
     ("q", "quit"),
 ];
 
@@ -213,7 +213,8 @@ impl App<'_> {
                 self.set_picked(&all);
             }
             KeyCode::Tab | KeyCode::BackTab => self.view = 1 - self.view,
-            KeyCode::Enter => {
+            KeyCode::Enter => self.tree().toggle(),
+            KeyCode::Char('d') | KeyCode::Delete => {
                 if self.picked_count() == 0 {
                     self.notice = Some("Nothing selected yet. Press space to select.");
                 } else {

@@ -23,12 +23,13 @@ project type in one keystroke, or expand it and decide directory by directory.
 | `↑` `↓` / `j` `k` | move |
 | `→` / `l` | expand, then step into |
 | `←` / `h` | collapse, then jump to parent |
+| `enter` | expand / collapse |
 | `space` / `x` | select / deselect the row and everything under it |
 | `a` | select / deselect everything |
 | `e` | expand / collapse everything |
 | `s` | sort by size or by age, stalest first |
 | `tab` | switch between *by type* and *by directory* views |
-| `enter` | delete the selection, after confirming (`←` `→` to choose, `enter`) |
+| `d` / `delete` | delete the selection, after confirming (`←` `→` to choose, `enter`) |
 | `q` / `esc` | quit without deleting |
 
 Selections carry over between the two views.

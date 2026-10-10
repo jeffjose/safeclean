@@ -240,6 +240,15 @@ impl Tree {
         self.cursor = self.rows.len().saturating_sub(1);
     }
 
+    /// Flips the current node between expanded and collapsed.
+    pub fn toggle(&mut self) {
+        let id = self.current();
+        if !self.nodes[id].children.is_empty() {
+            self.nodes[id].expanded = !self.nodes[id].expanded;
+            self.refresh();
+        }
+    }
+
     /// Expands the current node, or steps into it if already expanded.
     pub fn expand(&mut self) {
         let id = self.current();
