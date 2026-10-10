@@ -1,5 +1,6 @@
 use crate::scanner::{Disk, Found, age, human};
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
 use crate::tree::Tree;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -20,7 +21,8 @@ const BAR_WIDTH: usize = 8;
 
 const KEYS: &[(&str, &str)] = &[
     ("↑↓", "move"),
-    ("enter", "fold"),
+    ("enter", "open"),
+    ("<", "back"),
     ("x", "select"),
     ("a", "all"),
     ("e", "expand"),
@@ -35,19 +37,27 @@ struct App<'a> {
     root: &'a str,
     disk: Option<Disk>,
     dry: bool,
+    /// Deletes one path; a no-op in a dry run.
+    remove: &'a dyn Fn(&Path) -> io::Result<()>,
+    /// Re-reads free space after a deletion.
+    disk_now: &'a dyn Fn() -> Option<Disk>,
     /// Selection per item, shared by both views.
     picked: Vec<bool>,
+    /// Items deleted so far this session.
+    gone: Vec<bool>,
+    session: Session,
     trees: [Tree; 2],
     view: usize,
     total: u64,
     /// Rows visible in the list, as of the last draw.
     height: usize,
-    confirming: bool,
-    /// Which button has focus in the confirmation dialog.
-    confirm_delete: bool,
+    /// Items the open confirmation dialog is asking about; empty when closed.
+    pending: Vec<usize>,
+    /// Whether "Yes" has focus in the confirmation dialog.
+    confirm_yes: bool,
     /// Stalest first rather than biggest first.
     by_age: bool,
-    notice: Option<&'static str>,
+    notice: Option<String>,
 }
 
 enum Action {
@@ -55,33 +65,47 @@ enum Action {
     Delete,
 }
 
-/// Runs the interactive picker. Returns the indices of the items the user
-/// confirmed for deletion; empty if they quit.
-pub fn run(items: &[Found], root: &str, disk: Option<Disk>, dry: bool) -> io::Result<Vec<usize>> {
+/// What a run of the picker did.
+#[derive(Default)]
+pub struct Session {
+    pub deleted: Vec<usize>,
+    pub failures: Vec<(usize, io::Error)>,
+}
+
+/// Runs the interactive picker, deleting in place as the user confirms, and
+/// returns what was deleted by index into `items`.
+pub fn run(
+    items: &[Found],
+    root: &str,
+    disk: Option<Disk>,
+    dry: bool,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
+    disk_now: &dyn Fn() -> Option<Disk>,
+) -> io::Result<Session> {
     let mut app = App {
         items,
         root,
         disk,
         dry,
+        remove,
+        disk_now,
         picked: vec![false; items.len()],
+        gone: vec![false; items.len()],
+        session: Session::default(),
         trees: [Tree::by_type(items), Tree::by_dir(items)],
         view: BY_TYPE,
         total: items.iter().map(|f| f.size).sum(),
         height: 1,
-        confirming: false,
-        confirm_delete: false,
+        pending: Vec::new(),
+        confirm_yes: false,
         by_age: false,
         notice: None,
     };
 
     let mut terminal = ratatui::init();
-    let action = app.event_loop(&mut terminal);
+    let result = app.event_loop(&mut terminal);
     ratatui::restore();
-
-    Ok(match action? {
-        Action::Quit => Vec::new(),
-        Action::Delete => (0..items.len()).filter(|&i| app.picked[i]).collect(),
-    })
+    result.map(|()| app.session)
 }
 
 /// Pads or truncates `text` to exactly `width` terminal columns.
@@ -130,16 +154,87 @@ fn size_color(bytes: u64) -> Color {
 }
 
 impl App<'_> {
-    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<Action> {
+    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         loop {
             terminal.draw(|frame| self.draw(frame))?;
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && let Some(action) = self.on_key(key)
-            {
-                return Ok(action);
+            let Event::Key(key) = event::read()? else { continue };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match self.on_key(key) {
+                Some(Action::Quit) => return Ok(()),
+                Some(Action::Delete) => {
+                    self.delete_pending(terminal)?;
+                    // Nothing left to pick from.
+                    if self.gone.iter().all(|&gone| gone) {
+                        return Ok(());
+                    }
+                }
+                None => {}
             }
         }
+    }
+
+    /// Deletes what the confirmation dialog asked about and takes it out of
+    /// the tree, leaving the picker open for the next decision.
+    fn delete_pending(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending);
+        let mut freed = 0;
+        let mut count = 0;
+        let mut last_error = None;
+        let mut drawn: Option<Instant> = None;
+        let items = self.items;
+
+        for (n, &i) in pending.iter().enumerate() {
+            let item = &items[i];
+            // Redrawing per item would cost more than deleting small ones.
+            if drawn.is_none_or(|at| at.elapsed() >= Duration::from_millis(50)) {
+                self.notice = Some(format!("Deleting {}/{}  {}", n + 1, pending.len(), item.rel.display()));
+                terminal.draw(|frame| self.draw(frame))?;
+                drawn = Some(Instant::now());
+            }
+            self.session.failures.retain(|(failed, _)| *failed != i);
+            match (self.remove)(&item.path) {
+                Ok(()) => {
+                    self.gone[i] = true;
+                    self.picked[i] = false;
+                    self.session.deleted.push(i);
+                    freed += item.size;
+                    count += 1;
+                }
+                Err(err) => {
+                    last_error = Some(format!("{}: {err}", item.rel.display()));
+                    self.session.failures.push((i, err));
+                }
+            }
+        }
+
+        self.total -= freed;
+        for tree in &mut self.trees {
+            tree.prune(&self.gone, self.items);
+            tree.recount(&self.picked);
+        }
+        self.disk = match self.dry {
+            true => self.disk.map(|disk| Disk { free: disk.free + freed, ..disk }),
+            false => (self.disk_now)().or(self.disk),
+        };
+        let verb = if self.dry { "Would have freed" } else { "Freed" };
+        let noun = if count == 1 { "item" } else { "items" };
+        self.notice = Some(match last_error {
+            Some(error) => format!("{verb} {} in {count} {noun}. Failed: {error}", human(freed)),
+            None => format!("{verb} {} in {count} {noun}", human(freed)),
+        });
+        Ok(())
+    }
+
+    /// What `d` acts on: the selection if there is one, else the row under
+    /// the cursor.
+    fn deletion_targets(&self) -> Vec<usize> {
+        if self.picked_count() > 0 {
+            return (0..self.items.len()).filter(|&i| self.picked[i]).collect();
+        }
+        let tree = &self.trees[self.view];
+        tree.leaves(tree.current()).into_iter().filter(|&i| !self.gone[i]).collect()
     }
 
     fn tree(&mut self) -> &mut Tree {
@@ -168,14 +263,14 @@ impl App<'_> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Some(Action::Quit);
         }
-        if self.confirming {
+        if !self.pending.is_empty() {
             match key.code {
                 KeyCode::Char('y' | 'Y') => return Some(Action::Delete),
-                KeyCode::Enter if self.confirm_delete => return Some(Action::Delete),
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('h' | 'l') => {
-                    self.confirm_delete = !self.confirm_delete;
-                }
-                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => self.confirming = false,
+                KeyCode::Enter if self.confirm_yes => return Some(Action::Delete),
+                KeyCode::Left | KeyCode::Char('h' | '<') => self.confirm_yes = true,
+                KeyCode::Right | KeyCode::Char('l' | '>') => self.confirm_yes = false,
+                KeyCode::Tab | KeyCode::BackTab => self.confirm_yes = !self.confirm_yes,
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => self.pending.clear(),
                 _ => {}
             }
             return None;
@@ -209,19 +304,16 @@ impl App<'_> {
                 self.set_picked(&leaves);
             }
             KeyCode::Char('a') => {
-                let all: Vec<usize> = (0..self.items.len()).collect();
+                let all: Vec<usize> = (0..self.items.len()).filter(|&i| !self.gone[i]).collect();
                 self.set_picked(&all);
             }
             KeyCode::Tab | KeyCode::BackTab => self.view = 1 - self.view,
-            KeyCode::Enter => self.tree().toggle(),
+            KeyCode::Enter | KeyCode::Char('>') => self.tree().enter(),
+            KeyCode::Char('<') => self.tree().back(),
             KeyCode::Char('d') | KeyCode::Delete => {
-                if self.picked_count() == 0 {
-                    self.notice = Some("Nothing selected yet. Press space to select.");
-                } else {
-                    self.confirming = true;
-                    // Start on the harmless choice.
-                    self.confirm_delete = false;
-                }
+                self.pending = self.deletion_targets();
+                // Start on the harmless choice.
+                self.confirm_yes = false;
             }
             _ => {}
         }
@@ -300,7 +392,7 @@ impl App<'_> {
             .collect();
         frame.render_widget(Line::from(keys), help);
 
-        if self.confirming {
+        if !self.pending.is_empty() {
             self.draw_confirm(frame);
         }
     }
@@ -369,7 +461,7 @@ impl App<'_> {
     }
 
     fn status_line(&self) -> Line<'static> {
-        if let Some(notice) = self.notice {
+        if let Some(notice) = &self.notice {
             return Line::from(format!(" {notice}").yellow());
         }
         let count = self.picked_count();
@@ -377,7 +469,7 @@ impl App<'_> {
         let spans = vec![
             " Selected ".into(),
             if count == 0 { format!("{count}").dim() } else { format!("{count}").green().bold() },
-            format!(" of {} items · ", self.items.len()).into(),
+            format!(" of {} items · ", self.gone.iter().filter(|&&gone| !gone).count()).into(),
             if count == 0 { size.dim() } else { size.green().bold() },
             format!(" of {}", human(self.total)).into(),
         ];
@@ -386,7 +478,7 @@ impl App<'_> {
 
     fn draw_confirm(&self, frame: &mut Frame) {
         let area = frame.area();
-        let width = 54.min(area.width.saturating_sub(2));
+        let width = 60.min(area.width.saturating_sub(2));
         let height = 9.min(area.height);
         let popup = Rect::new(
             area.x + (area.width - width) / 2,
@@ -396,32 +488,35 @@ impl App<'_> {
         );
 
         let button = |label: &'static str, focused: bool, color: Color| {
-                if focused {
-                    Span::styled(format!("  {label}  "), Style::new().fg(color).add_modifier(Modifier::REVERSED | Modifier::BOLD))
-                } else {
-                    Span::styled(format!("  {label}  "), Style::new().dim())
-                }
-            };
-        let count = self.picked_count();
-        let noun = if count == 1 { "item" } else { "items" };
+            if focused {
+                Span::styled(
+                    format!("  {label}  "),
+                    Style::new().fg(color).add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!("  {label}  "), Style::new().dim())
+            }
+        };
+        let size: u64 = self.pending.iter().map(|&i| self.items[i].size).sum();
+        let what = match self.pending[..] {
+            [only] => fit(&self.items[only].rel.display().to_string(), (width as usize).saturating_sub(14))
+                .trim_end()
+                .to_string(),
+            _ => format!("{} items", self.pending.len()),
+        };
+        let caveat = if self.dry { "dry run, nothing is deleted" } else { "cannot be undone" };
         let text = vec![
             Line::raw(""),
-            Line::from(vec![
-                "Delete ".into(),
-                format!("{count} {noun}").bold(),
-                " and free ".into(),
-                human(self.picked_size()).green().bold(),
-                "?".into(),
-            ]),
-            Line::from(if self.dry { "dry run, nothing is deleted" } else { "This cannot be undone." }.dim()),
+            Line::from(vec!["Delete ".into(), what.bold(), "?".into()]),
+            Line::from(vec!["frees ".dim(), human(size).green().bold(), format!(" · {caveat}").dim()]),
             Line::raw(""),
             Line::from(vec![
-                button("Cancel", !self.confirm_delete, Color::Reset),
+                button("Yes", self.confirm_yes, Color::Red),
                 "   ".into(),
-                button("Delete", self.confirm_delete, Color::Red),
+                button("No", !self.confirm_yes, Color::Reset),
             ]),
             Line::raw(""),
-            Line::from("←→ choose · enter confirm · y/n".dim()),
+            Line::from("←→ choose · enter confirm".dim()),
         ];
         let block = Block::bordered()
             .border_type(BorderType::Rounded)

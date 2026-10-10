@@ -23,16 +23,21 @@ project type in one keystroke, or expand it and decide directory by directory.
 | `↑` `↓` / `j` `k` | move |
 | `→` / `l` | expand, then step into |
 | `←` / `h` | collapse, then jump to parent |
-| `enter` | expand / collapse |
+| `enter` / `>` | go in: open the row and land on its first child |
+| `<` | go back: close the parent and land on it |
 | `space` / `x` | select / deselect the row and everything under it |
 | `a` | select / deselect everything |
 | `e` | expand / collapse everything |
 | `s` | sort by size or by age, stalest first |
 | `tab` | switch between *by type* and *by directory* views |
-| `d` / `delete` | delete the selection, after confirming (`←` `→` to choose, `enter`) |
-| `q` / `esc` | quit without deleting |
+| `d` / `delete` | delete the selection, or the row under the cursor if nothing is selected |
+| `q` / `esc` | quit, with a summary of what was freed |
 
 Selections carry over between the two views.
+
+`d` asks first, with **No** focused: press `←` then `enter` (or just `y`) to
+go ahead. The deletion happens right there, the rows disappear, and you carry
+on picking.
 
 ## What it finds
 

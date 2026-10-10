@@ -296,8 +296,27 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let chosen: Vec<usize> = if cli.yes {
-        (0..found.len()).collect()
+    let remover = |path: &Path| if dry { Ok(()) } else { remove(path) };
+    let disk_now = || Disk::of(&root);
+
+    let session = if cli.yes {
+        // Show progress in place rather than a line per item.
+        let progress = io::stderr().is_terminal();
+        let mut session = tui::Session::default();
+        for (i, item) in found.iter().enumerate() {
+            if progress {
+                let name: String = item.rel.display().to_string().chars().take(60).collect();
+                eprint!("\r\x1b[2K{} {}/{}  {name}", paint(DIM, "Deleting"), i + 1, found.len());
+            }
+            match remover(&item.path) {
+                Ok(()) => session.deleted.push(i),
+                Err(err) => session.failures.push((i, err)),
+            }
+        }
+        if progress {
+            eprint!("\r\x1b[2K");
+        }
+        session
     } else if !interactive {
         print_listing(&found);
         if !dry {
@@ -305,8 +324,8 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     } else {
-        match tui::run(&found, &scope, disk, dry) {
-            Ok(chosen) => chosen,
+        match tui::run(&found, &scope, disk, dry, &remover, &disk_now) {
+            Ok(session) => session,
             Err(err) => {
                 eprintln!("{} {err}", paint(RED, "error:"));
                 return ExitCode::FAILURE;
@@ -314,43 +333,28 @@ fn main() -> ExitCode {
         }
     };
 
-    if chosen.is_empty() {
+    if session.deleted.is_empty() && session.failures.is_empty() {
         println!("Nothing deleted.");
         return ExitCode::SUCCESS;
     }
 
-    // Per-item lines would scroll the result away, so show progress in
-    // place and summarise by kind afterwards.
-    let progress = io::stderr().is_terminal();
     let mut freed: Vec<(ProjectType, usize, u64)> = Vec::new();
-    let mut failures: Vec<(&Found, io::Error)> = Vec::new();
-    for (done, &i) in chosen.iter().enumerate() {
-        let item = &found[i];
-        if progress {
-            let name: String = item.rel.display().to_string().chars().take(60).collect();
-            eprint!("\r\x1b[2K{} {}/{}  {name}", paint(DIM, "Deleting"), done + 1, chosen.len());
+    for item in session.deleted.iter().map(|&i| &found[i]) {
+        match freed.iter_mut().find(|(kind, ..)| *kind == item.kind) {
+            Some((_, count, size)) => {
+                *count += 1;
+                *size += item.size;
+            }
+            None => freed.push((item.kind, 1, item.size)),
         }
-        match if dry { Ok(()) } else { remove(&item.path) } {
-            Ok(()) => match freed.iter_mut().find(|(kind, ..)| *kind == item.kind) {
-                Some((_, count, size)) => {
-                    *count += 1;
-                    *size += item.size;
-                }
-                None => freed.push((item.kind, 1, item.size)),
-            },
-            Err(err) => failures.push((item, err)),
-        }
-    }
-    if progress {
-        eprint!("\r\x1b[2K");
     }
     freed.sort_by_key(|&(_, _, size)| std::cmp::Reverse(size));
 
-    let deleted: usize = freed.iter().map(|&(_, count, _)| count).sum();
+    let deleted = session.deleted.len();
     let total: u64 = freed.iter().map(|&(_, _, size)| size).sum();
     let now_free = match (dry, disk) {
         (true, Some(before)) => Some(before.free + total),
-        (false, Some(_)) => Disk::of(&root).map(|after| after.free),
+        (false, Some(_)) => disk_now().map(|after| after.free),
         _ => None,
     };
 
@@ -371,11 +375,12 @@ fn main() -> ExitCode {
     if let (Some(before), Some(now)) = (disk, now_free) {
         print_disk(before, now);
     }
-    if !failures.is_empty() {
+    if !session.failures.is_empty() {
+        let failed = session.failures.len();
         println!();
-        println!("{}", paint(RED, format!("Could not delete {} {}", failures.len(), plural(failures.len()))));
-        for (item, err) in &failures {
-            println!("  {}  {}", item.rel.display(), paint(DIM, err));
+        println!("{}", paint(RED, format!("Could not delete {failed} {}", plural(failed))));
+        for (i, err) in &session.failures {
+            println!("  {}  {}", found[*i].rel.display(), paint(DIM, err));
         }
         return ExitCode::FAILURE;
     }

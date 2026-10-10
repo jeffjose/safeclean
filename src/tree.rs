@@ -240,13 +240,26 @@ impl Tree {
         self.cursor = self.rows.len().saturating_sub(1);
     }
 
-    /// Flips the current node between expanded and collapsed.
-    pub fn toggle(&mut self) {
+    /// Goes into the current node: opens it and lands on its first child.
+    pub fn enter(&mut self) {
         let id = self.current();
-        if !self.nodes[id].children.is_empty() {
-            self.nodes[id].expanded = !self.nodes[id].expanded;
-            self.refresh();
+        if self.nodes[id].children.is_empty() {
+            return;
         }
+        self.nodes[id].expanded = true;
+        self.refresh();
+        self.focus(id);
+        self.cursor += 1;
+    }
+
+    /// Goes back out: closes the parent and lands on it. At the top level
+    /// there is nowhere to go, so it just closes the current node.
+    pub fn back(&mut self) {
+        let id = self.current();
+        let target = self.nodes[id].parent.unwrap_or(id);
+        self.nodes[target].expanded = false;
+        self.refresh();
+        self.focus(target);
     }
 
     /// Expands the current node, or steps into it if already expanded.
@@ -298,6 +311,28 @@ impl Tree {
             stack.extend(&node.children);
         }
         out
+    }
+
+    /// Drops deleted items: totals shrink and whatever is left empty
+    /// disappears. Expansion and cursor position carry over.
+    pub fn prune(&mut self, gone: &[bool], items: &[Found]) {
+        for id in (0..self.nodes.len()).rev() {
+            if let Some(item) = self.nodes[id].leaf {
+                let alive = !gone[item];
+                self.nodes[id].count = alive as usize;
+                self.nodes[id].size = if alive { items[item].size } else { 0 };
+                continue;
+            }
+            let kept: Vec<usize> =
+                self.nodes[id].children.iter().copied().filter(|&child| self.nodes[child].count > 0).collect();
+            self.nodes[id].size = kept.iter().map(|&child| self.nodes[child].size).sum();
+            self.nodes[id].count = kept.iter().map(|&child| self.nodes[child].count).sum();
+            self.nodes[id].modified = kept.iter().map(|&child| self.nodes[child].modified).max().flatten();
+            self.nodes[id].children = kept;
+        }
+        let nodes = &self.nodes;
+        self.roots.retain(|&root| nodes[root].count > 0);
+        self.refresh();
     }
 
     /// Recomputes how many leaves are selected under every node.
