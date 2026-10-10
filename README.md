@@ -1,10 +1,10 @@
 # safeclean
 
-Find build artifacts and dependency caches, pick what to delete from a
+Find build artifacts, caches and temp files, pick what to delete from a
 collapsible tree, and reclaim the disk space.
 
 ```bash
-safeclean                  # scan current dir, pick interactively
+safeclean                  # current dir plus caches, temp files and trash
 safeclean ~/projects       # scan a specific path
 safeclean -t rust,node     # only these project types
 safeclean -n               # dry run: pick as usual, delete nothing
@@ -26,6 +26,7 @@ project type in one keystroke, or expand it and decide directory by directory.
 | `space` | select / deselect the row and everything under it |
 | `a` | select / deselect everything |
 | `e` | expand / collapse everything |
+| `s` | sort by size or by age, stalest first |
 | `tab` | switch between *by type* and *by directory* views |
 | `enter` | delete the selection (asks for `y` first) |
 | `q` / `esc` | quit without deleting |
@@ -52,6 +53,32 @@ present, so a stray `target/` or `build/` folder is left alone.
 | `haskell` | `dist-newstyle` `.stack-work` | |
 | `dart` | `.dart_tool` `build` | `pubspec.yaml` |
 | `terraform` | `.terraform` | |
+
+### Around the machine
+
+Run with no directory and safeclean also looks in the usual places disposable
+data piles up. Give it a directory and it sticks to that directory; add `-s`
+to bring these back, or `-S` to leave them out of a bare run. `-y` never
+includes them unless you pass `-s`.
+
+| Type (`-t`) | Where | Offered as |
+| --- | --- | --- |
+| `cache` | `~/.cache` (or `$XDG_CACHE_HOME`), `~/Library/Caches` | one item per entry |
+| `packages` | `~/.npm/_cacache` `~/.bun/install/cache` `~/.local/share/pnpm/store` `~/.cargo/registry` `~/.cargo/git` `~/.gradle/caches` `~/.m2/repository` `~/.nuget/packages` `~/.pub-cache` `~/go/pkg/mod` | one item each |
+| `temp` | `/tmp`, `/var/tmp`, `$TMPDIR` | one item per entry you own |
+| `trash` | `~/.local/share/Trash`, `~/.Trash` | the trash |
+
+Sockets, pipes and symlinks in temp directories are never offered, but a
+running program may still be using a file or directory there. That is what the
+age column is for.
+
+## How stale is it
+
+Every row shows when it was last touched, and `s` re-sorts stalest first. For
+a project that means the project, not the artifact: the newest change among
+its files, its top-level directories and their contents, which takes in
+`.git/index` and the build output itself. So both an edit and a build count as
+activity. Recent rows are yellow, ones idle for 90 days or more are green.
 
 Sizes are disk usage (like `du`), symlinks are never followed, and the scan
 stays on one filesystem. The walk runs on every core. `--fast` measures only a

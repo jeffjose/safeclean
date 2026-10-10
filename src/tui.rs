@@ -1,4 +1,5 @@
-use crate::scanner::{Disk, Found, human};
+use crate::scanner::{Disk, Found, age, human};
+use std::time::{Duration, SystemTime};
 use crate::tree::Tree;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -14,14 +15,16 @@ const BY_DIR: usize = 1;
 
 const META_WIDTH: usize = 14;
 const SIZE_WIDTH: usize = 10;
+const AGE_WIDTH: usize = 6;
 const BAR_WIDTH: usize = 10;
 
 const KEYS: &[(&str, &str)] = &[
     ("↑↓", "move"),
-    ("←→", "collapse/expand"),
+    ("←→", "fold"),
     ("space", "select"),
     ("a", "all"),
-    ("e", "expand all"),
+    ("e", "expand"),
+    ("s", "sort"),
     ("tab", "view"),
     ("enter", "delete"),
     ("q", "quit"),
@@ -40,6 +43,8 @@ struct App<'a> {
     /// Rows visible in the list, as of the last draw.
     height: usize,
     confirming: bool,
+    /// Stalest first rather than biggest first.
+    by_age: bool,
     notice: Option<&'static str>,
 }
 
@@ -62,6 +67,7 @@ pub fn run(items: &[Found], root: &str, disk: Option<Disk>, dry: bool) -> io::Re
         total: items.iter().map(|f| f.size).sum(),
         height: 1,
         confirming: false,
+        by_age: false,
         notice: None,
     };
 
@@ -97,6 +103,18 @@ fn fit(text: &str, width: usize) -> String {
     }
     out.push_str(&" ".repeat(width - used));
     out
+}
+
+/// Recently touched things stand out as a warning; long-idle ones as fair
+/// game.
+fn age_style(modified: Option<SystemTime>) -> Style {
+    const DAY: u64 = 24 * 3600;
+    let idle = modified.and_then(|at| at.elapsed().ok()).unwrap_or(Duration::ZERO).as_secs();
+    match idle {
+        s if s < 7 * DAY => Style::new().yellow(),
+        s if s >= 90 * DAY => Style::new().green(),
+        _ => Style::new().dim(),
+    }
 }
 
 fn size_color(bytes: u64) -> Color {
@@ -167,6 +185,12 @@ impl App<'_> {
             KeyCode::End | KeyCode::Char('G') => self.tree().move_to_end(),
             KeyCode::Right | KeyCode::Char('l') => self.tree().expand(),
             KeyCode::Left | KeyCode::Char('h') => self.tree().collapse(),
+            KeyCode::Char('s') => {
+                self.by_age = !self.by_age;
+                for tree in &mut self.trees {
+                    tree.sort(self.by_age);
+                }
+            }
             KeyCode::Char('e') => {
                 let expand = !self.tree().all_expanded();
                 self.tree().set_all_expanded(expand);
@@ -213,7 +237,15 @@ impl App<'_> {
                 if self.dry { "dry run ".yellow() } else { "".into() },
                 format!("{} ", self.root).dim(),
             ]))
-            .title(Line::from(vec![tab("By type", BY_TYPE), tab("By directory", BY_DIR), " ".into()]).right_aligned());
+            .title(
+                Line::from(vec![
+                    format!(" sort: {} ", if self.by_age { "age" } else { "size" }).dim(),
+                    tab("By type", BY_TYPE),
+                    tab("By directory", BY_DIR),
+                    " ".into(),
+                ])
+                .right_aligned(),
+            );
         let inner = block.inner(main);
         frame.render_widget(block, main);
 
@@ -281,14 +313,14 @@ impl App<'_> {
             // A type header already says what its leaves are.
             (Some(_), _) if self.view == BY_TYPE => String::new(),
             (Some(_), _) => node.tag.map_or(String::new(), |t| t.name().to_string()),
-            (None, 0) if node.count == 1 => "1 dir".to_string(),
-            (None, 0) => format!("{} dirs", node.count),
-            (None, picked) => format!("{picked}/{} dirs", node.count),
+            (None, 0) if node.count == 1 => "1 item".to_string(),
+            (None, 0) => format!("{} items", node.count),
+            (None, picked) => format!("{picked}/{} items", node.count),
         };
 
         let show_bar = width >= 80;
         let prefix = format!(" {}{arrow} ", "  ".repeat(node.depth));
-        let right = META_WIDTH + SIZE_WIDTH + if show_bar { BAR_WIDTH + 3 } else { 1 };
+        let right = META_WIDTH + AGE_WIDTH + SIZE_WIDTH + if show_bar { BAR_WIDTH + 3 } else { 1 };
         let room = width.saturating_sub(prefix.width() + 4 + right);
 
         let mut spans = vec![
@@ -300,6 +332,7 @@ impl App<'_> {
                 paint(if node.leaf.is_none() { Style::new().bold() } else { Style::new() }),
             ),
             Span::styled(format!("{meta:>META_WIDTH$}"), paint(Style::new().dim())),
+            Span::styled(format!("{:>AGE_WIDTH$}", age(node.modified)), paint(age_style(node.modified))),
             Span::styled(
                 format!("{:>SIZE_WIDTH$}", human(node.size)),
                 paint(Style::new().fg(size_color(node.size))),
@@ -331,7 +364,7 @@ impl App<'_> {
         let spans = vec![
             " Selected ".into(),
             if count == 0 { format!("{count}").dim() } else { format!("{count}").green().bold() },
-            format!(" of {} dirs · ", self.items.len()).into(),
+            format!(" of {} items · ", self.items.len()).into(),
             if count == 0 { size.dim() } else { size.green().bold() },
             format!(" of {}", human(self.total)).into(),
         ];
@@ -350,7 +383,7 @@ impl App<'_> {
         );
 
         let count = self.picked_count();
-        let noun = if count == 1 { "directory" } else { "directories" };
+        let noun = if count == 1 { "item" } else { "items" };
         let text = vec![
             Line::raw(""),
             Line::from(vec![

@@ -2,6 +2,8 @@ use crate::projects::ProjectType;
 use crate::scanner::Found;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::path::Component;
+use std::time::SystemTime;
 
 pub struct Node {
     pub label: String,
@@ -14,6 +16,8 @@ pub struct Node {
     pub depth: usize,
     pub expanded: bool,
     pub size: u64,
+    /// Most recent activity of anything beneath.
+    pub modified: Option<SystemTime>,
     /// Number of leaves beneath (1 for a leaf).
     pub count: usize,
     /// Number of those leaves currently selected.
@@ -64,18 +68,35 @@ fn trie(entries: Vec<Entry>, items: &[Found]) -> Vec<Draft> {
             let mut children = trie(group, items);
             if children.len() == 1 {
                 let only = children.pop().unwrap();
-                Draft { label: format!("{name}/{}", only.label), ..only }
+                Draft { label: join(name, &only.label), ..only }
             } else {
-                Draft { label: name.to_string(), tag: None, leaf: None, children }
+                Draft { label: join(name, ""), tag: None, leaf: None, children }
             }
         })
         .collect()
 }
 
+/// The filesystem root is carried as an empty component so that joining it
+/// to what follows reads `/tmp`, not `//tmp`.
+fn component(part: Component) -> String {
+    match part {
+        Component::RootDir => String::new(),
+        other => other.as_os_str().to_string_lossy().into_owned(),
+    }
+}
+
+fn join(parent: &str, child: &str) -> String {
+    match (parent, child) {
+        ("", "") => "/".to_string(),
+        (_, "") => parent.to_string(),
+        _ => format!("{parent}/{child}"),
+    }
+}
+
 fn components(items: &[Found]) -> Vec<Vec<String>> {
     items
         .iter()
-        .map(|f| f.rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect())
+        .map(|f| f.rel.components().map(component).collect())
         .collect()
 }
 
@@ -92,12 +113,19 @@ impl Tree {
                     .filter(|(_, f)| f.kind == kind)
                     .map(|(i, _)| (i, paths[i].as_slice()))
                     .collect();
-                (!entries.is_empty()).then(|| Draft {
-                    label: kind.name().to_string(),
-                    tag: Some(kind),
-                    leaf: None,
-                    children: trie(entries, items),
-                })
+                if entries.is_empty() {
+                    return None;
+                }
+                let mut label = kind.name().to_string();
+                let mut children = trie(entries, items);
+                // When everything of a kind sits under one directory, name it
+                // in the header instead of spending a level on it.
+                if children.len() == 1 && children[0].leaf.is_none() {
+                    let only = children.pop().unwrap();
+                    label = format!("{label} · {}", only.label);
+                    children = only.children;
+                }
+                Some(Draft { label, tag: Some(kind), leaf: None, children })
             })
             .collect();
         Self::build(drafts, items)
@@ -130,6 +158,7 @@ impl Tree {
             depth,
             expanded: false,
             size: draft.leaf.map_or(0, |i| items[i].size),
+            modified: draft.leaf.and_then(|i| items[i].modified),
             count: draft.leaf.is_some() as usize,
             picked: 0,
         });
@@ -139,6 +168,7 @@ impl Tree {
         children.sort_by_key(|&c| Reverse(self.nodes[c].size));
         self.nodes[id].size += children.iter().map(|&c| self.nodes[c].size).sum::<u64>();
         self.nodes[id].count += children.iter().map(|&c| self.nodes[c].count).sum::<usize>();
+        self.nodes[id].modified = children.iter().map(|&c| self.nodes[c].modified).max().unwrap_or(self.nodes[id].modified);
         self.nodes[id].children = children;
         id
     }
@@ -158,6 +188,29 @@ impl Tree {
         }
         self.rows = rows;
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+    }
+
+    /// Reorders every level: stalest first if `by_age`, else biggest first.
+    pub fn sort(&mut self, by_age: bool) {
+        let current = self.current();
+        let nodes = &self.nodes;
+        let order = |ids: &mut Vec<usize>| {
+            if by_age {
+                ids.sort_by_key(|&id| (nodes[id].modified, Reverse(nodes[id].size)));
+            } else {
+                ids.sort_by_key(|&id| Reverse(nodes[id].size));
+            }
+        };
+        let mut roots = std::mem::take(&mut self.roots);
+        order(&mut roots);
+        let mut sorted: Vec<Vec<usize>> = nodes.iter().map(|node| node.children.clone()).collect();
+        sorted.iter_mut().for_each(order);
+        self.roots = roots;
+        for (node, children) in self.nodes.iter_mut().zip(sorted) {
+            node.children = children;
+        }
+        self.refresh();
+        self.focus(current);
     }
 
     pub fn current(&self) -> usize {

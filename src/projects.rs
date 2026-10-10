@@ -21,6 +21,14 @@ pub enum ProjectType {
     Haskell,
     Dart,
     Terraform,
+    /// Everything in ~/.cache
+    Cache,
+    /// Package manager download caches: npm, cargo, gradle, maven, ...
+    Packages,
+    /// Your files in /tmp
+    #[value(alias = "tmp")]
+    Temp,
+    Trash,
 }
 
 impl ProjectType {
@@ -38,6 +46,10 @@ impl ProjectType {
         ProjectType::Haskell,
         ProjectType::Dart,
         ProjectType::Terraform,
+        ProjectType::Cache,
+        ProjectType::Packages,
+        ProjectType::Temp,
+        ProjectType::Trash,
     ];
 
     pub fn name(self) -> &'static str {
@@ -55,7 +67,17 @@ impl ProjectType {
             ProjectType::Haskell => "Haskell",
             ProjectType::Dart => "Dart",
             ProjectType::Terraform => "Terraform",
+            ProjectType::Cache => "User cache",
+            ProjectType::Packages => "Package caches",
+            ProjectType::Temp => "Temp files",
+            ProjectType::Trash => "Trash",
         }
+    }
+
+    /// Kinds that come from well-known locations on the machine rather than
+    /// from projects found by walking a directory.
+    pub fn is_system(self) -> bool {
+        matches!(self, ProjectType::Cache | ProjectType::Packages | ProjectType::Temp | ProjectType::Trash)
     }
 }
 

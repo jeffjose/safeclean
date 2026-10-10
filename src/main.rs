@@ -1,31 +1,41 @@
 mod projects;
 mod scanner;
+mod system;
 mod tree;
 mod tui;
 
 use clap::Parser;
 use projects::ProjectType;
-use scanner::{Disk, Found, Progress, human};
+use scanner::{Disk, Found, Progress, age, human, tilde};
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{env, fs, thread};
 
 #[derive(Parser)]
 #[command(name = "safeclean", version)]
-#[command(about = "Find and delete build artifacts and dependency caches to reclaim disk space")]
+#[command(about = "Find and delete build artifacts, caches and temp files to reclaim disk space")]
 struct Cli {
-    /// Directory to scan
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    /// Directory to scan for projects. Without one, scans the current
+    /// directory plus the machine's cache and temp locations
+    path: Option<PathBuf>,
 
-    /// Only look for these project types (repeatable or comma-separated)
+    /// Only look for these kinds (repeatable or comma-separated)
     #[arg(short = 't', long = "type", value_enum, value_delimiter = ',', value_name = "TYPE")]
     types: Vec<ProjectType>,
+
+    /// Include ~/.cache, package caches, /tmp and the trash even when a
+    /// directory or -y is given
+    #[arg(short = 's', long)]
+    system: bool,
+
+    /// Leave the machine's cache and temp locations out
+    #[arg(short = 'S', long, conflicts_with = "system")]
+    no_system: bool,
 
     /// Go through the motions without deleting anything
     #[arg(short = 'n', long)]
@@ -61,57 +71,65 @@ fn paint(code: &str, text: impl Display) -> String {
 }
 
 fn plural(count: usize) -> &'static str {
-    if count == 1 { "directory" } else { "directories" }
+    if count == 1 { "item" } else { "items" }
 }
 
-fn tilde(path: &Path) -> String {
-    if let Some(home) = env::var_os("HOME")
-        && let Ok(rest) = path.strip_prefix(&home)
-    {
-        return Path::new("~").join(rest).display().to_string();
-    }
-    path.display().to_string()
-}
-
-fn demo_data(enabled: &HashSet<ProjectType>) -> (PathBuf, Vec<Found>) {
+fn demo_data(enabled: &HashSet<ProjectType>, system: bool) -> (PathBuf, Vec<Found>) {
     use ProjectType::*;
     const MB: u64 = 1_000_000;
+    const DAY: u64 = 24 * 3600;
     let root = PathBuf::from("/home/user/projects");
     let found = [
-        ("api-server/target", Rust, 1_892 * MB),
-        ("cli-tool/target", Rust, 456 * MB),
-        ("experiments/parsers/json/target", Rust, 234 * MB),
-        ("monorepo/node_modules", Node, 892 * MB),
-        ("monorepo/apps/web/node_modules", Node, 654 * MB),
-        ("monorepo/apps/web/.next", Web, 345 * MB),
-        ("monorepo/apps/docs/node_modules", Node, 212 * MB),
-        ("monorepo/apps/docs/.svelte-kit", Web, 48 * MB),
-        ("monorepo/packages/ui/node_modules", Node, 97 * MB),
-        ("blog/node_modules", Node, 423 * MB),
-        ("ml-pipeline/.venv", Python, 1_234 * MB),
-        ("ml-pipeline/src/__pycache__", Python, 3 * MB),
-        ("ml-pipeline/src/models/__pycache__", Python, 9 * MB),
-        ("ml-pipeline/.pytest_cache", Python, MB / 4),
-        ("data-analysis/.venv", Python, 567 * MB),
-        ("android-app/build", Gradle, 789 * MB),
-        ("android-app/.gradle", Gradle, 234 * MB),
-        ("infra/staging/.terraform", Terraform, 310 * MB),
+        ("api-server/target", Rust, 1_892 * MB, 0),
+        ("cli-tool/target", Rust, 456 * MB, 64),
+        ("experiments/parsers/json/target", Rust, 234 * MB, 410),
+        ("monorepo/node_modules", Node, 892 * MB, 2),
+        ("monorepo/apps/web/node_modules", Node, 654 * MB, 2),
+        ("monorepo/apps/web/.next", Web, 345 * MB, 2),
+        ("monorepo/apps/docs/node_modules", Node, 212 * MB, 19),
+        ("monorepo/apps/docs/.svelte-kit", Web, 48 * MB, 19),
+        ("monorepo/packages/ui/node_modules", Node, 97 * MB, 33),
+        ("blog/node_modules", Node, 423 * MB, 240),
+        ("ml-pipeline/.venv", Python, 1_234 * MB, 9),
+        ("ml-pipeline/src/__pycache__", Python, 3 * MB, 9),
+        ("ml-pipeline/src/models/__pycache__", Python, 9 * MB, 9),
+        ("ml-pipeline/.pytest_cache", Python, MB / 4, 9),
+        ("data-analysis/.venv", Python, 567 * MB, 130),
+        ("android-app/build", Gradle, 789 * MB, 800),
+        ("android-app/.gradle", Gradle, 234 * MB, 800),
+        ("infra/staging/.terraform", Terraform, 310 * MB, 51),
+        ("~/.cache/pip", Cache, 1_420 * MB, 9),
+        ("~/.cache/uv", Cache, 2_310 * MB, 1),
+        ("~/.cache/google-chrome", Cache, 880 * MB, 0),
+        ("~/.cache/thumbnails", Cache, 96 * MB, 3),
+        ("~/.npm/_cacache", Packages, 3_150 * MB, 2),
+        ("~/.cargo/registry", Packages, 2_740 * MB, 0),
+        ("~/.gradle/caches", Packages, 5_900 * MB, 800),
+        ("/tmp/rust-analyzer-build", Temp, 610 * MB, 12),
+        ("/tmp/download.iso", Temp, 1_900 * MB, 45),
+        ("~/.local/share/Trash", Trash, 4_200 * MB, 6),
     ]
     .into_iter()
-    .filter(|(_, kind, _)| enabled.contains(kind))
-    .map(|(rel, kind, size)| Found { path: root.join(rel), rel: rel.into(), kind, size })
+    .filter(|(_, kind, ..)| enabled.contains(kind) && (system || !kind.is_system()))
+    .map(|(rel, kind, size, days)| Found {
+        path: root.join(rel),
+        rel: rel.into(),
+        kind,
+        size,
+        modified: SystemTime::now().checked_sub(Duration::from_secs(days * DAY + 60)),
+    })
     .collect();
     (root, found)
 }
 
 /// Runs the scan on a worker thread, showing live progress on stderr.
-fn scan_with_spinner(root: &Path, enabled: &HashSet<ProjectType>, fast: bool) -> Vec<Found> {
+fn scan_with_spinner(root: &Path, system: bool, enabled: &HashSet<ProjectType>, fast: bool) -> Vec<Found> {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let progress = Progress::default();
     let animate = io::stderr().is_terminal();
 
     thread::scope(|scope| {
-        let worker = scope.spawn(|| scanner::scan(root, enabled, fast, &progress));
+        let worker = scope.spawn(|| scanner::scan(root, system, enabled, fast, &progress));
         let mut stderr = io::stderr();
         let mut tick = 0;
         while animate && !worker.is_finished() {
@@ -119,7 +137,7 @@ fn scan_with_spinner(root: &Path, enabled: &HashSet<ProjectType>, fast: bool) ->
                 stderr,
                 "\r\x1b[2K{} Scanning {} · {} found, {}",
                 FRAMES[tick % FRAMES.len()],
-                tilde(root),
+                tilde(root).display(),
                 progress.found.load(Ordering::Relaxed),
                 human(progress.bytes.load(Ordering::Relaxed)),
             );
@@ -135,23 +153,29 @@ fn scan_with_spinner(root: &Path, enabled: &HashSet<ProjectType>, fast: bool) ->
 }
 
 fn print_listing(found: &[Found]) {
-    let width = found.iter().map(|f| f.rel.display().to_string().chars().count()).max().unwrap_or(0);
+    // One absurdly long name should not push every size off the screen.
+    let width = found.iter().map(|f| f.rel.display().to_string().chars().count()).max().unwrap_or(0).min(60);
     let mut groups: Vec<(ProjectType, Vec<&Found>)> = ProjectType::ALL
         .iter()
         .map(|&kind| (kind, found.iter().filter(|f| f.kind == kind).collect::<Vec<_>>()))
-        .filter(|(_, dirs)| !dirs.is_empty())
+        .filter(|(_, items)| !items.is_empty())
         .collect();
-    groups.sort_by_key(|(_, dirs)| std::cmp::Reverse(dirs.iter().map(|f| f.size).sum::<u64>()));
+    groups.sort_by_key(|(_, items)| std::cmp::Reverse(items.iter().map(|f| f.size).sum::<u64>()));
 
-    for (kind, dirs) in groups {
-        let size: u64 = dirs.iter().map(|f| f.size).sum();
+    for (kind, items) in groups {
+        let size: u64 = items.iter().map(|f| f.size).sum();
         println!(
             "{}  {}",
             paint(BOLD, kind.name()),
-            paint(DIM, format!("{} {}, {}", dirs.len(), plural(dirs.len()), human(size)))
+            paint(DIM, format!("{} {}, {}", items.len(), plural(items.len()), human(size)))
         );
-        for dir in dirs {
-            println!("  {:<width$}  {:>9}", dir.rel.display(), human(dir.size));
+        for item in items {
+            println!(
+                "  {:<width$}  {:>9}  {}",
+                item.rel.display(),
+                human(item.size),
+                paint(DIM, format!("{:>4}", age(item.modified)))
+            );
         }
         println!();
     }
@@ -190,12 +214,45 @@ fn print_disk(before: Disk, now_free: u64) {
     println!("  used  {:.0}% → {:.0}%", percent_used(before.free), percent_used(now_free));
 }
 
-fn remove(path: &Path) -> io::Result<()> {
-    // A symlink swapped in since the scan must not be followed.
-    if !fs::symlink_metadata(path)?.is_dir() {
-        return Err(io::Error::other("no longer a directory"));
+/// Makes every directory under `path` writable by its owner. Some caches,
+/// Go's module cache among them, are stored read-only.
+#[cfg(unix)]
+fn unlock(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::symlink_metadata(path) else { return };
+    if !meta.is_dir() {
+        return;
     }
-    fs::remove_dir_all(path)
+    let mut perms = meta.permissions();
+    perms.set_mode(perms.mode() | 0o700);
+    let _ = fs::set_permissions(path, perms);
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            unlock(&entry.path());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn unlock(_: &Path) {}
+
+fn remove(path: &Path) -> io::Result<()> {
+    // Whatever is there now is judged afresh: a symlink swapped in since the
+    // scan must not be followed.
+    let meta = fs::symlink_metadata(path)?;
+    if meta.is_file() {
+        return fs::remove_file(path);
+    }
+    if !meta.is_dir() {
+        return Err(io::Error::other("no longer a file or directory"));
+    }
+    match fs::remove_dir_all(path) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            unlock(path);
+            fs::remove_dir_all(path)
+        }
+        result => result,
+    }
 }
 
 fn main() -> ExitCode {
@@ -208,26 +265,34 @@ fn main() -> ExitCode {
     } else {
         cli.types.iter().copied().collect()
     };
+    // Pointing at a directory means that directory, and -y is too blunt to
+    // be let loose on the whole machine unasked.
+    let system = !cli.no_system && (cli.system || (cli.path.is_none() && !cli.yes));
 
     let (root, found) = if cli.demo {
-        demo_data(&enabled)
+        demo_data(&enabled, system)
     } else {
-        let root = match cli.path.canonicalize() {
+        let path = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
+        let root = match path.canonicalize() {
             Ok(root) if root.is_dir() => root,
             _ => {
-                eprintln!("{} not a directory: {}", paint(RED, "error:"), cli.path.display());
+                eprintln!("{} not a directory: {}", paint(RED, "error:"), path.display());
                 return ExitCode::FAILURE;
             }
         };
-        let found = scan_with_spinner(&root, &enabled, cli.fast);
+        let found = scan_with_spinner(&root, system, &enabled, cli.fast);
         (root, found)
     };
 
     let disk = if cli.demo { Some(Disk { free: 182 << 30, total: 1 << 40 }) } else { Disk::of(&root) };
     let dry = cli.dry_run || cli.demo;
+    let scope = match system {
+        true => format!("{} + system", tilde(&root).display()),
+        false => tilde(&root).display().to_string(),
+    };
 
     if found.is_empty() {
-        println!("No cleanable directories found in {}", tilde(&root));
+        println!("Nothing to clean in {scope}");
         return ExitCode::SUCCESS;
     }
 
@@ -240,7 +305,7 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     } else {
-        match tui::run(&found, &tilde(&root), disk, dry) {
+        match tui::run(&found, &scope, disk, dry) {
             Ok(chosen) => chosen,
             Err(err) => {
                 eprintln!("{} {err}", paint(RED, "error:"));
@@ -254,37 +319,30 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let width = chosen.iter().map(|&i| found[i].rel.display().to_string().chars().count()).max().unwrap_or(0);
+    let width = chosen.iter().map(|&i| found[i].rel.display().to_string().chars().count()).max().unwrap_or(0).min(60);
     let mut freed: u64 = 0;
     let mut deleted = 0;
     let mut failed = 0;
     for &i in &chosen {
-        let dir = &found[i];
-        match if dry { Ok(()) } else { remove(&dir.path) } {
+        let item = &found[i];
+        match if dry { Ok(()) } else { remove(&item.path) } {
             Ok(()) => {
-                freed += dir.size;
+                freed += item.size;
                 deleted += 1;
-                println!("{} {:<width$}  {:>9}", paint(GREEN, "✓"), dir.rel.display(), human(dir.size));
+                println!("{} {:<width$}  {:>9}", paint(GREEN, "✓"), item.rel.display(), human(item.size));
             }
             Err(err) => {
                 failed += 1;
-                println!("{} {:<width$}  {}", paint(RED, "✗"), dir.rel.display(), paint(RED, err));
+                println!("{} {:<width$}  {}", paint(RED, "✗"), item.rel.display(), paint(RED, err));
             }
         }
     }
 
-    // What the filesystem reports is the truth; the per-directory sizes are
-    // only what we expected to get back.
     let now_free = match (dry, disk) {
         (true, Some(before)) => Some(before.free + freed),
         (false, Some(_)) => Disk::of(&root).map(|after| after.free),
         _ => None,
     };
-    if let (Some(before), Some(now)) = (disk, now_free)
-        && now > before.free
-    {
-        freed = now - before.free;
-    }
 
     println!();
     let headline = if dry { "Dry run, would have freed" } else { "Freed" };

@@ -1,9 +1,11 @@
 use crate::projects::{self, ProjectType};
+use crate::system;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct Found {
@@ -12,6 +14,8 @@ pub struct Found {
     pub rel: PathBuf,
     pub kind: ProjectType,
     pub size: u64,
+    /// When the project (or, outside projects, the entry) last changed.
+    pub modified: Option<SystemTime>,
 }
 
 /// Live counters a caller can poll while a scan runs on another thread.
@@ -33,6 +37,50 @@ pub fn human(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+/// How long ago `modified` was, in the largest sensible unit.
+pub fn age(modified: Option<SystemTime>) -> String {
+    const HOUR: u64 = 3600;
+    const DAY: u64 = 24 * HOUR;
+    let Some(modified) = modified else {
+        return String::new();
+    };
+    let secs = modified.elapsed().unwrap_or(Duration::ZERO).as_secs();
+    match secs {
+        s if s < HOUR => "now".to_string(),
+        s if s < DAY => format!("{}h", s / HOUR),
+        s if s < 14 * DAY => format!("{}d", s / DAY),
+        s if s < 60 * DAY => format!("{}w", s / (7 * DAY)),
+        s if s < 730 * DAY => format!("{}mo", s / (30 * DAY)),
+        s => format!("{}y", s / (365 * DAY)),
+    }
+}
+
+/// Most entries looked at per directory when dating something.
+const DATING_LIMIT: usize = 256;
+
+/// Newest modification time of `path` and what it holds, `depth` levels down.
+fn newest(path: &Path, depth: usize) -> Option<SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let mut newest = meta.modified().ok();
+    if depth > 0 && meta.is_dir() {
+        for entry in std::fs::read_dir(path).ok()?.flatten().take(DATING_LIMIT) {
+            newest = newest.max(self::newest(&entry.path(), depth - 1));
+        }
+    }
+    newest
+}
+
+/// When something was last worked on. For a project artifact that is the
+/// project around it: its files, its top-level directories and what is in
+/// them (which takes in `.git/index` and the artifact's own contents), so
+/// both an edit and a build count. Elsewhere it is just the entry itself.
+fn last_touched(path: &Path, kind: ProjectType) -> Option<SystemTime> {
+    match path.parent() {
+        Some(project) if !kind.is_system() => newest(project, 2),
+        _ => newest(path, 1),
+    }
 }
 
 /// Space actually occupied on disk, like `du`, rather than apparent length.
@@ -82,6 +130,15 @@ fn dir_size(path: &Path, fast: bool) -> u64 {
     DIR_BLOCK + own + dirs.par_iter().map(|dir| dir_size(dir, fast)).sum::<u64>()
 }
 
+/// Disk usage of a found entry, which outside of projects may be a file.
+fn entry_size(path: &Path, fast: bool) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => dir_size(path, fast),
+        Ok(meta) => disk_usage(&meta),
+        Err(_) => 0,
+    }
+}
+
 #[cfg(unix)]
 fn device(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -95,6 +152,8 @@ fn device(_: &Path) -> Option<u64> {
 
 struct Search<'a> {
     enabled: &'a HashSet<ProjectType>,
+    /// Directories handled elsewhere, not to be entered.
+    skip: &'a [PathBuf],
     device: Option<u64>,
     progress: &'a Progress,
     hits: Mutex<Vec<(PathBuf, ProjectType)>>,
@@ -116,6 +175,9 @@ impl Search<'_> {
                 continue;
             }
             let path = entry.path();
+            if self.skip.contains(&path) {
+                continue;
+            }
             // Never look for artifacts inside an artifact, wanted or not.
             match projects::classify(&path, name) {
                 Some(kind) if self.enabled.contains(&kind) => {
@@ -134,20 +196,50 @@ impl Search<'_> {
     }
 }
 
-pub fn scan(root: &Path, enabled: &HashSet<ProjectType>, fast: bool, progress: &Progress) -> Vec<Found> {
-    let search = Search { enabled, device: device(root), progress, hits: Mutex::new(Vec::new()) };
-    search.walk(root);
+/// `path` with the home directory abbreviated to `~`.
+pub fn tilde(path: &Path) -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => match path.strip_prefix(&home) {
+            Ok(rest) => Path::new("~").join(rest),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
 
-    let mut found: Vec<Found> = search
-        .hits
-        .into_inner()
-        .unwrap()
+/// Finds project artifacts under `root` and, if `system` is set, disposable
+/// data in the machine's well-known cache and temp locations.
+pub fn scan(
+    root: &Path,
+    system: bool,
+    enabled: &HashSet<ProjectType>,
+    fast: bool,
+    progress: &Progress,
+) -> Vec<Found> {
+    let skip = if system { system::roots() } else { Vec::new() };
+    let mut hits = if system { system::candidates(enabled) } else { Vec::new() };
+    progress.found.fetch_add(hits.len(), Ordering::Relaxed);
+
+    // A scan started inside one of those locations has nothing to add.
+    if !system::covers(&skip, root) {
+        let search = Search { enabled, skip: &skip, device: device(root), progress, hits: Mutex::new(Vec::new()) };
+        search.walk(root);
+        hits.extend(search.hits.into_inner().unwrap());
+    }
+
+    let mut found: Vec<Found> = hits
         .into_par_iter()
         .map(|(path, kind)| {
-            let size = dir_size(&path, fast);
+            let size = entry_size(&path, fast);
+            let modified = last_touched(&path, kind);
             progress.bytes.fetch_add(size, Ordering::Relaxed);
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-            Found { path, rel, kind, size }
+            // Project artifacts read best relative to where the scan began;
+            // anything else needs its full path to make sense.
+            let rel = match path.strip_prefix(root) {
+                Ok(rel) if !kind.is_system() => rel.to_path_buf(),
+                _ => tilde(&path),
+            };
+            Found { path, rel, kind, size, modified }
         })
         .collect();
 
