@@ -16,7 +16,7 @@ const BY_DIR: usize = 1;
 const META_WIDTH: usize = 14;
 const SIZE_WIDTH: usize = 10;
 const AGE_WIDTH: usize = 6;
-const BAR_WIDTH: usize = 10;
+const BAR_WIDTH: usize = 8;
 
 const KEYS: &[(&str, &str)] = &[
     ("↑↓", "move"),
@@ -304,6 +304,8 @@ impl App<'_> {
         }
     }
 
+    /// One row, laid out so the things you decide on sit together on the
+    /// left: checkbox, size, age, and only then the tree.
     fn row(&self, id: usize, is_cursor: bool, width: usize) -> Line<'static> {
         let node = &self.trees[self.view].nodes[id];
         // The cursor row is drawn reversed, where per-span colours only clash.
@@ -328,38 +330,38 @@ impl App<'_> {
             (None, picked) => format!("{picked}/{} items", node.count),
         };
 
-        let show_bar = width >= 80;
-        let prefix = format!(" {}{arrow} ", "  ".repeat(node.depth));
-        let right = META_WIDTH + AGE_WIDTH + SIZE_WIDTH + if show_bar { BAR_WIDTH + 3 } else { 1 };
-        let room = width.saturating_sub(prefix.width() + 4 + right);
-
         let mut spans = vec![
-            Span::raw(prefix),
-            Span::styled(checkbox, paint(checkbox_style)),
             Span::raw(" "),
-            Span::styled(
-                fit(&node.label, room),
-                paint(if node.leaf.is_none() { Style::new().bold() } else { Style::new() }),
-            ),
-            Span::styled(format!("{meta:>META_WIDTH$}"), paint(Style::new().dim())),
-            Span::styled(format!("{:>AGE_WIDTH$}", age(node.modified)), paint(age_style(node.modified))),
+            Span::styled(checkbox, paint(checkbox_style)),
             Span::styled(
                 format!("{:>SIZE_WIDTH$}", human(node.size)),
                 paint(Style::new().fg(size_color(node.size))),
             ),
         ];
-        if show_bar {
+        let mut used = 1 + 3 + SIZE_WIDTH;
+        if width >= 90 {
             let filled = if self.total == 0 {
                 0
             } else {
                 ((node.size as f64 / self.total as f64) * BAR_WIDTH as f64).ceil() as usize
             };
             let filled = filled.min(BAR_WIDTH);
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
             spans.push(Span::styled("█".repeat(filled), paint(Style::new().blue())));
             spans.push(Span::styled("░".repeat(BAR_WIDTH - filled), paint(Style::new().dim())));
+            used += 1 + BAR_WIDTH;
         }
-        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!("{:>AGE_WIDTH$}", age(node.modified)), paint(age_style(node.modified))));
+        used += AGE_WIDTH;
+
+        let tree = format!("  {}{arrow} ", "  ".repeat(node.depth));
+        let room = width.saturating_sub(used + tree.width() + META_WIDTH + 1);
+        spans.push(Span::raw(tree));
+        spans.push(Span::styled(
+            fit(&node.label, room),
+            paint(if node.leaf.is_none() { Style::new().bold() } else { Style::new() }),
+        ));
+        spans.push(Span::styled(format!("{meta:>META_WIDTH$} "), paint(Style::new().dim())));
 
         let line = Line::from(spans);
         if is_cursor { line.style(Style::new().add_modifier(Modifier::REVERSED)) } else { line }
