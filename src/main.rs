@@ -27,7 +27,7 @@ struct Cli {
     #[arg(short = 't', long = "type", value_enum, value_delimiter = ',', value_name = "TYPE")]
     types: Vec<ProjectType>,
 
-    /// List what was found without deleting anything
+    /// Go through the motions without deleting anything
     #[arg(short = 'n', long)]
     dry_run: bool,
 
@@ -224,6 +224,7 @@ fn main() -> ExitCode {
     };
 
     let disk = if cli.demo { Some(Disk { free: 182 << 30, total: 1 << 40 }) } else { Disk::of(&root) };
+    let dry = cli.dry_run || cli.demo;
 
     if found.is_empty() {
         println!("No cleanable directories found in {}", tilde(&root));
@@ -232,14 +233,14 @@ fn main() -> ExitCode {
 
     let chosen: Vec<usize> = if cli.yes {
         (0..found.len()).collect()
-    } else if cli.dry_run || !interactive {
+    } else if !interactive {
         print_listing(&found);
-        if !cli.dry_run {
+        if !dry {
             eprintln!("\nNot a terminal, so nothing was deleted. Pass -y to delete everything listed.");
         }
         return ExitCode::SUCCESS;
     } else {
-        match tui::run(&found, &tilde(&root), disk, cli.demo) {
+        match tui::run(&found, &tilde(&root), disk, dry) {
             Ok(chosen) => chosen,
             Err(err) => {
                 eprintln!("{} {err}", paint(RED, "error:"));
@@ -259,7 +260,7 @@ fn main() -> ExitCode {
     let mut failed = 0;
     for &i in &chosen {
         let dir = &found[i];
-        match if cli.demo { Ok(()) } else { remove(&dir.path) } {
+        match if dry { Ok(()) } else { remove(&dir.path) } {
             Ok(()) => {
                 freed += dir.size;
                 deleted += 1;
@@ -274,7 +275,7 @@ fn main() -> ExitCode {
 
     // What the filesystem reports is the truth; the per-directory sizes are
     // only what we expected to get back.
-    let now_free = match (cli.demo, disk) {
+    let now_free = match (dry, disk) {
         (true, Some(before)) => Some(before.free + freed),
         (false, Some(_)) => Disk::of(&root).map(|after| after.free),
         _ => None,
@@ -286,7 +287,7 @@ fn main() -> ExitCode {
     }
 
     println!();
-    let headline = if cli.demo { "Demo, would have freed" } else { "Freed" };
+    let headline = if dry { "Dry run, would have freed" } else { "Freed" };
     println!("{headline} {} in {deleted} {}", paint(GREEN, paint(BOLD, human(freed))), plural(deleted));
     if let (Some(before), Some(now)) = (disk, now_free) {
         print_disk(before, now);

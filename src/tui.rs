@@ -31,7 +31,7 @@ struct App<'a> {
     items: &'a [Found],
     root: &'a str,
     disk: Option<Disk>,
-    demo: bool,
+    dry: bool,
     /// Selection per item, shared by both views.
     picked: Vec<bool>,
     trees: [Tree; 2],
@@ -50,12 +50,12 @@ enum Action {
 
 /// Runs the interactive picker. Returns the indices of the items the user
 /// confirmed for deletion; empty if they quit.
-pub fn run(items: &[Found], root: &str, disk: Option<Disk>, demo: bool) -> io::Result<Vec<usize>> {
+pub fn run(items: &[Found], root: &str, disk: Option<Disk>, dry: bool) -> io::Result<Vec<usize>> {
     let mut app = App {
         items,
         root,
         disk,
-        demo,
+        dry,
         picked: vec![false; items.len()],
         trees: [Tree::by_type(items), Tree::by_dir(items)],
         view: BY_TYPE,
@@ -210,7 +210,7 @@ impl App<'_> {
             .border_style(Style::new().dim())
             .title(Line::from(vec![
                 " safeclean ".bold(),
-                if self.demo { "demo ".yellow() } else { "".into() },
+                if self.dry { "dry run ".yellow() } else { "".into() },
                 format!("{} ", self.root).dim(),
             ]))
             .title(Line::from(vec![tab("By type", BY_TYPE), tab("By directory", BY_DIR), " ".into()]).right_aligned());
@@ -360,7 +360,7 @@ impl App<'_> {
                 human(self.picked_size()).green().bold(),
                 "?".into(),
             ]),
-            Line::from(if self.demo { "demo mode, nothing is deleted" } else { "This cannot be undone." }.dim()),
+            Line::from(if self.dry { "dry run, nothing is deleted" } else { "This cannot be undone." }.dim()),
             Line::raw(""),
             Line::from(vec![" y ".reversed().bold(), " delete    ".into(), " n ".reversed(), " cancel".into()]),
         ];

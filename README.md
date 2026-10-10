@@ -7,7 +7,7 @@ collapsible tree, and reclaim the disk space.
 safeclean                  # scan current dir, pick interactively
 safeclean ~/projects       # scan a specific path
 safeclean -t rust,node     # only these project types
-safeclean -n               # list what was found, delete nothing
+safeclean -n               # dry run: pick as usual, delete nothing
 safeclean -y               # delete everything found, no questions
 safeclean --fast           # estimate sizes by sampling big directories
 safeclean --demo           # try the UI on simulated data
